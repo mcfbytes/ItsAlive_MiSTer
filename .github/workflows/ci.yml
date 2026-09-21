@@ -33,7 +33,7 @@ jobs:
     name: fmt, clippy, test
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - name: Install the pinned toolchain
         run: |
           rustup show active-toolchain || rustup toolchain install
@@ -72,17 +72,25 @@ jobs:
           - armv7-unknown-linux-gnueabihf
           - armv7-unknown-linux-musleabihf
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - name: Install the pinned toolchain
         run: |
           rustup show active-toolchain || rustup toolchain install
           rustup component add clippy
           rustup target add ${{ matrix.target }}
-      - name: Install the cross linker
+      # libc6-dev-armhf-cross is not optional and must not be dropped:
+      # gcc-arm-linux-gnueabihf ships the compiler but only *recommends* the
+      # target glibc, so under --no-install-recommends the link fails on
+      # `cannot find Scrt1.o` / `crti.o` -- the startup objects live in that
+      # package. Nothing catches this locally, where a developer's cross
+      # toolchain was installed with recommends on, and the clippy step above
+      # does not catch it either, because clippy never links.
+      - name: Install the cross linker and the target glibc
         if: matrix.target == 'armv7-unknown-linux-gnueabihf'
         run: |
           sudo apt-get update
-          sudo apt-get install -y --no-install-recommends gcc-arm-linux-gnueabihf
+          sudo apt-get install -y --no-install-recommends \
+            gcc-arm-linux-gnueabihf libc6-dev-armhf-cross
       # Lint on the target, not just on the host. src/hw.rs is the reason:
       # libc::Ioctl is c_ulong on gnueabihf and c_int on musleabihf, and
       # libc::off_t is 32-bit on one and 64-bit on the other, so the host job
