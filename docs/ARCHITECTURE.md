@@ -254,10 +254,18 @@ Default mode: **1280x720@60**, `Fpix = 74.25`, timings
   monitor. Interrupt arming is the one place this shows up as a byte on the
   wire: `0x94` is the INT1 enable mask, and Main writes
   `hdmi_has_int() ? 0xC0 : 0x00` there (`video.cpp:1465`, `:1568`), asking the
-  fabric whether the core routes the interrupt pin. We ask nothing and write
-  `0x94 = 0x00` unconditionally. That is the only byte of the 92 that differs
-  from Main on a core with the pin; if HPD ever gets serviced, this row and
-  the mailbox query have to land together.
+  fabric over the mailbox (`UIO_HDMI_INT`, `user_io.h:78`). We ask nothing and
+  write `0x94 = 0x00` unconditionally.
+
+  Be precise about what that costs, because the obvious reading is too kind:
+  the framework's answer to that opcode is a hardwired constant, not a
+  per-core wire, so `hdmi_has_int()` returns 1 on every core built on it and
+  **Main writes `0xC0` here, always**. This is therefore a deliberate
+  divergence from stock, not a case where we happen to agree — the one byte of
+  the 92 where we differ, unconditionally. It is inert for a one-shot tool
+  because nothing in this crate ever reads the ADV7513's INT pin, and arming
+  an interrupt that nobody services would only latch status bits. If HPD ever
+  gets serviced, this row and the mailbox query have to land together.
 
 ## 5. UIO_SET_FBUF: 10 words, plus the kernel knob
 
@@ -319,6 +327,15 @@ Then write `8888 1 <fb_width> <fb_height> <fb_width*4>` to
 `video.cpp:3459-3471`), which makes the kernel driver re-register `/dev/fb0`
 at that geometry so fbcon follows. Do the sysfs write **after** the fabric
 command, as Main does.
+
+**And before any pixels.** The driver's store handler blanks the *whole*
+reservation before it re-registers — `memset(p_fbdev->fb_base, 0,
+resource_size(p_fbdev->fb_res))` (`MiSTer_fb.c:350`), ahead of the `sscanf`
+and `fb_set`, and sized by the resource rather than by the visible geometry.
+So the order is burst, then knob, then pixels, and `say` must never run before
+`fb enable` has written the knob. Painting first produces a black screen with
+every host-side signal healthy — the same symptom as a missing §1 step 3, and
+easy to confuse with it.
 
 Pixel format on the Linux side is XRGB8888 with the RxB bit set, i.e. what the
 kernel driver calls `8888` with `rb = 1`. The tool never writes pixels itself

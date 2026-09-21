@@ -107,15 +107,22 @@ const FB_BUFFER: u32 = 0;
 /// starts that far into the region.
 ///
 /// The `n ? 0 : 4096` term is the interesting one: **buffer 0 alone is pushed
-/// forward by one 4 KiB page.** That page belongs to the `MiSTer_fb` kernel
-/// module, which is the only consumer of buffer 0; the pixels it exposes as
-/// `/dev/fb0` begin at `FB_ADDR + 4096`, so that is where the fabric's frame
-/// reader must be pointed or the picture would be one page of header out of
-/// step with what fbcon draws. Main's other use of the same address agrees
+/// forward by one 4 KiB page.** That page is the kernel driver's *palette*
+/// page, not a header: `MiSTer_fb` points `info->pseudo_palette` at the base
+/// of the reservation and starts the pixels one page later
+/// (`MiSTer_fb.c:241`, `:269-270` — `smem_start = fb_res->start + 4096`,
+/// `screen_base = fb_base + 4096`). So `/dev/fb0`'s pixels begin at
+/// `FB_ADDR + 4096` and that is where the fabric's frame reader must point, or
+/// it scans one page out of step with what fbcon draws.
+///
+/// There is nothing for anyone to write there on this path. The palette page
+/// only matters in the 8bpp `PAL8` format, which we never select — in `8888`
+/// it is simply skipped by both sides. Do not go looking for a header the
+/// fabric expects; there isn't one. Main's other use of the same address agrees
 /// verbatim: the `video_cmd` path hard-codes `uint32_t addr = FB_ADDR + 4096;`
 /// (`video.cpp:4282`) because that path is always buffer 0. Buffers 1 and 2 are
 /// never handed to the kernel driver — Main maps and paints them itself — so
-/// they carry no header page and get no skip.
+/// they carry no palette page and get no skip.
 ///
 /// For buffer 0: `0x22000000 + 0 + 0x1000 = 0x22001000`.
 const fn fb_addr(n: u32) -> u32 {
