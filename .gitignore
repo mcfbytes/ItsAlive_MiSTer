@@ -1,2 +1,5 @@
 /target
 Cargo.lock.bak
+
+# Claude Code scratch, including the linked worktrees agents run in.
+/.claude/
