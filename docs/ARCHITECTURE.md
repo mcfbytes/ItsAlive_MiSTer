@@ -260,6 +260,16 @@ the reply, and send the payload only when it is non-zero. A core that answers
 of pushing ten words at a core that is not listening. `UIO_SET_VIDEO` has no
 such gate (§2).
 
+**A core that answers `0` is reported, not failed.** The tool says so on
+stderr — Main's own line is "Core doesn't support HPS frame buffer"
+(`video.cpp:3535`) — skips the sysfs write, and exits 0, because §7's table
+has no code for it and inventing one would change what a non-zero exit means
+to the installer. Skipping the sysfs write is the part that matters: a core
+with no HPS frame buffer is not scanning `/dev/fb0` out, so re-registering it
+at a new geometry would leave a rig log looking green and a monitor black. If
+a later phase needs to tell this case apart programmatically, it gets a code
+of its own here and in §7 together.
+
 `fb_width`/`fb_height` are the **framebuffer's** size and are not in general the
 mode's active area: `video_fb_config()` sets `fb_width = item[1] / fb_scale_x`
 and `fb_height = item[5] / fb_scale_y` (`video.cpp:3575-3576`), where `fb_scale`
@@ -347,6 +357,7 @@ itsalive fb enable [--mode 720p|480p] | disable
 itsalive say [--clear] <text>...
 itsalive up [--mode ...]        = hdmi + fb enable, the installer's one call
 itsalive leds <mask>            optional, v1.1: UIO_LEDS 0x25, on-board LEDs
+itsalive --help                 the usage text, on stdout, exit 0
 ```
 
 | Exit | Meaning | Installer's reaction |
@@ -361,6 +372,17 @@ itsalive leds <mask>            optional, v1.1: UIO_LEDS 0x25, on-board LEDs
 
 `probe` prints one line per finding and exits with the first failing code, so
 the installer can decide before it tries `up`. `--json` is for the rig log.
+Its three findings are the bitstream, the ADV7513's bus and the presence of
+the sysfs knob; it asks the first with a bare GPI read (`is_fpga_ready(1)`,
+`fpga_io.cpp:655-662`) rather than a mailbox transfer, so it writes nothing at
+all, can be run twice, and cannot itself report exit 11.
+
+The same GPI read guards `hdmi`, `fb` and `up` before their first write. Main
+has no such check — it meets an unconfigured fabric inside `fpga_spi()`
+(`fpga_io.cpp:699`) and reboots the board — but §1 is why we need one: with no
+bitstream the HPS i2c peripheral is not routed to the chip, so without it the
+92 bulk writes would all NAK into the void before the first mailbox word
+produced exit 10 anyway.
 
 Every hardware subcommand is idempotent: running `hdmi` twice is harmless,
 and `fb enable` after `hdmi` after `up` is harmless.

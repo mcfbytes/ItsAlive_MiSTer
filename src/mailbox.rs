@@ -51,12 +51,18 @@ pub const GPI_OFFSET: usize = 0x14;
 const DATA_MASK: u32 = 0xFFFF;
 
 /// Strobe, GPO bit 17. `fpga_io.cpp:665` — `#define SSPI_STROBE (1<<17)`.
-const SSPI_STROBE: u32 = 1 << 17;
+///
+/// Public so that a fake [`Regs`] outside this module can mirror the strobe
+/// into the ack the way the fabric does; `docs/ARCHITECTURE.md` §2 already
+/// publishes the bit position.
+pub const SSPI_STROBE: u32 = 1 << 17;
 
 /// Ack, GPI bit 17 — the same bit position as the strobe.
 ///
 /// `fpga_io.cpp:666` — `#define SSPI_ACK SSPI_STROBE`.
-const SSPI_ACK: u32 = SSPI_STROBE;
+///
+/// Public for the same reason as [`SSPI_STROBE`].
+pub const SSPI_ACK: u32 = SSPI_STROBE;
 
 /// GPO bit 31, ORed in by every enable change.
 ///
@@ -69,7 +75,13 @@ const SSPI_EN_BIT31: u32 = 0x8000_0000;
 ///
 /// `fpga_io.cpp:699` — the C reads GPI into a signed `int` and tests
 /// `if (gpi < 0)`, which is exactly "bit 31 set".
-const GPI_NOT_READY: u32 = 1 << 31;
+///
+/// Public because the bit is also readable on its own, with no transfer and
+/// no side effect: `is_fpga_ready(1)` is `return (fpga_gpi_read() >= 0);`
+/// (`fpga_io.cpp:655-662`). The CLI asks that question before it writes 92
+/// registers at a chip the fabric is not routing (`docs/ARCHITECTURE.md` §1),
+/// and `probe` asks it without disturbing anything at all.
+pub const GPI_NOT_READY: u32 = 1 << 31;
 
 /// Chip select for the core itself. `spi.cpp:5` — `SSPI_FPGA_EN (1<<18)`.
 pub const SSPI_FPGA_EN: u32 = 1 << 18;
