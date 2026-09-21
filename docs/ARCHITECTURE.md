@@ -377,12 +377,38 @@ Rules:
 - **`#![forbid(unsafe_op_in_unsafe_fn)]`, `unsafe` confined to `hw.rs` and
   `mailbox.rs` with a comment on every block.**
 - **Edition 2024, MSRV = the `rustc` Buildroot 2026.08 ships (1.97).**
-- **Target.** Whatever toolchain the consuming Buildroot config uses. The
-  installer is moving to the shared glibc toolchain
-  (`armv7-unknown-linux-gnueabihf`); the crate must also build for
-  `armv7-unknown-linux-musleabihf` with `+crt-static`, since that is what
-  the installer config on `master` still says today. No `std` features that
-  differ between the two. Two `libc` types *do* differ between them and both
+- **Target: both, and neither is optional.** This tool ships into two
+  different Buildroot images that deliberately use two different C libraries,
+  so it is built for two triples and CI gates on both.
+
+  | Consumer | Buildroot config | libc | Rust target |
+  |---|---|---|---|
+  | Installer initramfs (§8), the reason this project exists | `mister_installer_defconfig` | musl, **static** (`BR2_TOOLCHAIN_BUILDROOT_MUSL=y`, `BR2_STATIC_LIBS=y`) | `armv7-unknown-linux-musleabihf` |
+  | Installed system, for the rescue case | `mister_de10nano_defconfig` | glibc (Buildroot_MiSTer ADR 0001) | `armv7-unknown-linux-gnueabihf` |
+
+  **The musl build must be fully static**, not merely statically linked in
+  name: `BR2_STATIC_LIBS=y` means that initramfs contains no dynamic loader
+  and no shared libc, so a binary with an `INTERP` segment cannot start at
+  all. `.cargo/config.toml` sets `+crt-static` and `link-self-contained=yes`
+  for that target, and CI asserts `statically linked` rather than trusting
+  it. Verified: zero `NEEDED` entries, zero `INTERP` segments, and the
+  binary runs under `qemu-arm` with no sysroot.
+
+  **Do not delete the musl target as dead weight.** It is easy to conclude
+  the project standardised on glibc, because it partly did — the installer
+  *kernel* is re-linked against the already-built main glibc toolchain
+  rather than bootstrapping a second one (`scripts/mk-sdcard.sh` step 2,
+  which is a ~15 minute re-link instead of a ~3 hour from-scratch build).
+  That consolidation is real, and it stops at the kernel. The installer
+  *rootfs* is a separate, deliberately tiny static-musl cpio and was never
+  going to follow: it is embedded into the kernel image, so its size is
+  kernel size, and static musl is far smaller than static glibc for the
+  same job. Dropping `armv7-unknown-linux-musleabihf` would silently
+  produce a binary that cannot execute in the one image this tool was
+  written for.
+
+  No `std` features that differ between the two. Two `libc` types *do*
+  differ between them and both
   are load-bearing in `hw.rs`: `libc::Ioctl` is `c_ulong` on gnueabihf and
   `c_int` on musleabihf, so ioctl request numbers are written in that type
   rather than a hardcoded one; and `libc::off_t` is 32-bit on gnueabihf but

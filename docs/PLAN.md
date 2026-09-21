@@ -123,6 +123,18 @@ start-up on the same board. Each divergence goes in the test log.
 - The installer config gains `BR2_PACKAGE_ITSALIVE=y`; this pulls
   `host-rust-bin`, which is a download, not a compile, but a large one.
   Measure the CI-minute cost on the first run and record it in the PR.
+  The binary itself costs the installer image roughly 170-210 KB depending
+  on the kernel's initramfs compression (443 KB raw, 212 KB gzip -9, 169 KB
+  xz -9, measured on the phase 2 tree), and that lands in the kernel image
+  because the cpio is embedded in it.
+- **Watch the linker override.** `.cargo/config.toml` pins
+  `linker = "rust-lld"` for `armv7-unknown-linux-musleabihf`, which is what
+  lets this repo's own CI cross-link with nothing installed. Buildroot will
+  want to link with *its* toolchain, and cargo reads that file from the
+  package source, so the two may fight. Unverified — nobody has built this
+  under Buildroot yet. If it does fight, the fix is to keep the override out
+  of the packaged tarball or override it back in `itsalive.mk`, not to drop
+  `+crt-static`, which is mandatory (ARCHITECTURE §6).
 - Installer `init`: one `itsalive up` after the payload is staged in RAM,
   then `itsalive say` at each `splash_step`, all guarded, all under
   `timeout`, all `|| true`. `scripts/test-installer-splash.sh` and
@@ -131,8 +143,14 @@ start-up on the same board. Each divergence goes in the test log.
 - Docs: ADR 0020 §6 amended with the outcome; `docs/user/sdcard-flashing.md`
   loses "the screen stays blank the whole time" once the card test confirms
   the splash. The "static-musl" wording for the installer in ADR 0020,
-  `scripts/mk-sdcard.sh` and `docs/ci.md` is already stale if the installer
-  has moved to glibc; fix it in whichever PR moves it.
+  `scripts/mk-sdcard.sh` and `docs/ci.md` needs no change: it is accurate.
+  `configs/mister_installer_defconfig` sets `BR2_TOOLCHAIN_BUILDROOT_MUSL=y`
+  and `BR2_STATIC_LIBS=y`, and `git log --all -S` on that first line finds
+  exactly one commit — the one that added it. The installer rootfs has always
+  been static musl and no branch changes it. What *did* consolidate onto the
+  main glibc toolchain is the installer kernel re-link, which is a different
+  step (`scripts/mk-sdcard.sh` step 2); do not let the two be confused, in
+  either direction. See ARCHITECTURE §6.
 
 ## 5. Risks
 
