@@ -1,6 +1,6 @@
 //! The only module that talks to the kernel.
 //!
-//! Four interfaces, one per thing the tool has to touch:
+//! Five interfaces, one per thing the tool has to touch:
 //!
 //! * `/dev/mem` — one 4 KiB page mapped at the FPGA manager, which is the
 //!   [`crate::mailbox::Regs`] pair GPO/GPI ([`MemRegs`], `shmem.cpp:18-38`).
@@ -8,8 +8,12 @@
 //!   `ioctl(I2C_SLAVE)` plus the `I2C_SMBUS` ioctl ([`I2c`], `smbus.cpp:26-95`
 //!   and `:212-262`).
 //! * `/sys/module/MiSTer_fb/parameters/mode` — the kernel driver's geometry
-//!   knob ([`ModeFile`], `video.cpp:3459-3471`).
+//!   knob, written ([`ModeSink`]) and read back ([`ModeSource`]) through the
+//!   same [`ModeFile`] (`video.cpp:3459-3471`, `MiSTer_fb.c:343-371`).
 //! * `/dev/tty1` — where `say` puts its text for fbcon to paint ([`Tty`]).
+//! * `/dev/fb0` — where `image` puts its pixels ([`FbDevice`]), with plain
+//!   `write(2)` and no `mmap`, because the driver offers `.fb_write =
+//!   fb_sys_write` (`MiSTer_fb.c:137`).
 //!
 //! Everything above this module is pure and unit-tested; this module exists so
 //! that the real hardware satisfies the same traits the fakes do. None of the
@@ -44,7 +48,7 @@
 use crate::{Error, Result};
 use std::fmt;
 use std::fs::{File, OpenOptions};
-use std::io::{self, Write};
+use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
 // ---------------------------------------------------------------------------
@@ -79,6 +83,71 @@ pub trait ModeSink {
 pub trait TextSink {
     /// Write every byte of `bytes`, or fail.
     fn write_text(&mut self, bytes: &[u8]) -> Result<()>;
+}
+
+/// The other direction of the same knob: what the driver says it registered.
+///
+/// A separate trait from [`ModeSink`] because it has a separate reason to
+/// exist. Writing the line is a *request* — `mode_set()` returns 0
+/// unconditionally and its body is inside `if(p_fbdev)`
+/// (`MiSTer_fb.c:343-361`), so a successful write is no evidence at all on a
+/// kernel where `MiSTer_fb` never probed. Reading it back through `mode_get()`
+/// (`MiSTer_fb.c:364-371`) is the evidence, and it is what `itsalive image`
+/// gets its geometry from rather than trusting a flag from the caller.
+///
+/// [`ModeFile`] implements both, because both are the same file.
+pub trait ModeSource {
+    /// Read the whole knob, as the kernel rendered it.
+    ///
+    /// The bytes are handed on unparsed: [`crate::fb::parse_mode_line`] owns
+    /// the grammar, and an empty read is a legitimate answer (`mode_get`
+    /// returns 0 bytes when the driver never probed) rather than an error
+    /// here.
+    fn read_mode_line(&mut self) -> Result<String>;
+}
+
+/// Somewhere to put pixels — `/dev/fb0` in practice.
+///
+/// Byte offsets rather than rows or rectangles, because that is all the
+/// driver offers: `MiSTer_fb`'s `fb_ops` has `.fb_write = fb_sys_write`
+/// (`MiSTer_fb.c:137`), which is an ordinary `write(2)` honouring the file
+/// offset. There is no ioctl to blit with and, for this crate, no `mmap`
+/// either — so this trait is a seek and a write, and **nothing in the image
+/// path needs `unsafe`**.
+pub trait PixelSink {
+    /// Write every byte of `bytes` starting at byte `offset`, or fail.
+    fn write_at(&mut self, offset: u64, bytes: &[u8]) -> Result<()>;
+
+    /// Zero the first `len` bytes.
+    ///
+    /// Provided rather than required so that the real device and every fake
+    /// clear the same way, in the same order, through the same `write_at` a
+    /// test is already watching.
+    ///
+    /// `--clear` matters less than it looks: `itsalive fb enable`'s sysfs
+    /// write already blanks the whole reservation on its way past
+    /// (`memset(p_fbdev->fb_base, 0, resource_size(p_fbdev->fb_res))`,
+    /// `MiSTer_fb.c:350`, ahead of the `sscanf`), so it is a *second* image
+    /// that needs this — otherwise the first one shows through around it.
+    ///
+    /// One page at a time: the buffer is a `const`, so it costs no `.bss` and
+    /// a 1280x720 screen is 900 writes of 4 KiB, which against a write-through
+    /// mapping is not worth a bigger one.
+    fn clear(&mut self, len: u64) -> Result<()> {
+        const PAGE: [u8; 4096] = [0; 4096];
+        let mut done: u64 = 0;
+        while done < len {
+            // `try_from` cannot be wrong here and cannot panic if it is: a
+            // remainder that does not fit a `usize` is certainly larger than
+            // one page, which is what the fallback says.
+            let take = usize::try_from(len.saturating_sub(done))
+                .unwrap_or(PAGE.len())
+                .min(PAGE.len());
+            self.write_at(done, PAGE.get(..take).unwrap_or(&PAGE))?;
+            done = done.saturating_add(take as u64);
+        }
+        Ok(())
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -342,6 +411,27 @@ impl ModeSink for ModeFile {
     }
 }
 
+impl ModeSource for ModeFile {
+    /// `mode_get()` through sysfs (`MiSTer_fb.c:364-371`).
+    ///
+    /// One `read(2)` of the whole attribute, which is what a sysfs show
+    /// method produces: the kernel renders `.get`'s output into a page buffer,
+    /// appends a newline, and serves it. A knob whose driver never probed
+    /// returns 0 bytes and is read here as the empty string — a legitimate
+    /// answer that [`crate::fb::parse_mode_line`] turns into "run `itsalive fb
+    /// enable` first", not an I/O error.
+    ///
+    /// The bytes are not guaranteed to be UTF-8 by anything but the driver's
+    /// own `sprintf` of five `%u`s, so a lossy conversion rather than a
+    /// failure: a knob that somehow held other bytes should be reported as
+    /// unparseable geometry (exit 2), not as a read error (exit 14).
+    fn read_mode_line(&mut self) -> Result<String> {
+        let bytes = std::fs::read(&self.path)
+            .map_err(|e| Error::io(format!("read {}", self.path.display()), e))?;
+        Ok(String::from_utf8_lossy(&bytes).into_owned())
+    }
+}
+
 // ---------------------------------------------------------------------------
 // tty: where `say` puts its text
 // ---------------------------------------------------------------------------
@@ -405,6 +495,135 @@ impl TextSink for Tty {
             .write_all(bytes)
             .map_err(|e| Error::io(format!("write {}", self.path.display()), e))
     }
+}
+
+// ---------------------------------------------------------------------------
+// /dev/fb0: where `image` puts its pixels
+// ---------------------------------------------------------------------------
+
+/// The framebuffer `MiSTer_fb` registers, and the fabric's frame reader scans.
+pub const FB_DEV_PATH: &str = "/dev/fb0";
+
+/// A [`PixelSink`] over a framebuffer device, [`FB_DEV_PATH`] by default.
+///
+/// **Plain `write(2)`, no `mmap`, and therefore no `unsafe` anywhere in the
+/// image path.** The driver's `fb_ops` sets `.fb_write = fb_sys_write`
+/// (`MiSTer_fb.c:137`), the generic writer that copies from userspace into
+/// `info->screen_base` at `*ppos` and clamps the count against
+/// `info->fix.smem_len`, so a [`Seek`] plus a [`Write`] is the whole
+/// interface. Mapping the device would buy a `memcpy` in place of a syscall
+/// per row and would cost this crate its second `unsafe` module for it.
+///
+/// Nothing needs flushing afterwards either: the driver's mapping is
+/// `memremap(..., MEMREMAP_WT)` (`MiSTer_fb.c:261`), write-through, so the
+/// bytes are in DDR by the time the write returns and the fabric's frame
+/// reader — which does not walk the CPU's caches — sees them on the next
+/// scan. A [`File`] is unbuffered in userspace as well, so there is no
+/// `flush` to forget.
+#[derive(Debug)]
+pub struct FbDevice {
+    file: File,
+    path: PathBuf,
+}
+
+impl FbDevice {
+    /// Open [`FB_DEV_PATH`] for writing.
+    pub fn open() -> Result<Self> {
+        Self::at(FB_DEV_PATH)
+    }
+
+    /// The same writer pointed somewhere else, which is how it is tested.
+    ///
+    /// `write(true)` and nothing else: no `create`, because a missing
+    /// `/dev/fb0` is a fact about the board and inventing a regular file in
+    /// its place would turn exit 14 into a silent success that paints
+    /// nothing; and no `truncate`, which on a character device would be
+    /// meaningless and on the temporary file a test points this at would
+    /// throw away the very bytes the test is checking the offsets against.
+    pub fn at(path: impl Into<PathBuf>) -> Result<Self> {
+        let path = path.into();
+        let file = OpenOptions::new()
+            .write(true)
+            .open(&path)
+            .map_err(|e| Error::io(format!("open {}", path.display()), e))?;
+        Ok(Self { file, path })
+    }
+
+    /// The path this writer writes to.
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+}
+
+impl PixelSink for FbDevice {
+    /// `lseek(2)` then `write(2)`, looping.
+    ///
+    /// [`Write::write_all`] is the loop: it advances by the count each
+    /// `write(2)` returns, so a short write finishes on the next pass, and it
+    /// retries [`std::io::ErrorKind::Interrupted`] (`EINTR`). A framebuffer
+    /// device will not normally short-write, but `fb_sys_write` clamps the
+    /// count against `smem_len` and returns what it took, which is exactly a
+    /// short write — and the loop then gets `ENOSPC` on the next pass rather
+    /// than silently dropping the tail of a row.
+    fn write_at(&mut self, offset: u64, bytes: &[u8]) -> Result<()> {
+        self.file
+            .seek(SeekFrom::Start(offset))
+            .map_err(|e| Error::io(format!("seek {} to {offset}", self.path.display()), e))?;
+        self.file
+            .write_all(bytes)
+            .map_err(|e| Error::io(format!("write {}", self.path.display()), e))
+    }
+}
+
+/// Read an image source — a file, or standard input for `-` — stopping one
+/// byte past `limit`.
+///
+/// `-` is what makes `zcat splash.raw.gz | itsalive image -` work in the
+/// installer, where the payload is compressed and there is no room on the
+/// initramfs to land 3.5 MB of raw pixels first.
+///
+/// The whole source is read before any of it is written, on purpose: the
+/// length check in [`crate::fb::BlitPlan::check_source_len`] is the only thing
+/// that catches a converter invoked with the wrong pixel format, and it cannot
+/// run on a stream that is already half painted on the screen.
+///
+/// # Why there is a limit at all
+///
+/// `limit` is [`crate::fb::BlitPlan::source_len`] — the exact byte count the
+/// plan already knows it needs — and this reads `limit + 1` bytes at most, via
+/// [`Read::take`], whose own `read_to_end` caps the `Vec`'s growth at the
+/// remaining limit rather than at whatever arrives.
+///
+/// Without the cap an unbounded `read_to_end` is at the mercy of its argument:
+/// `zcat rootfs.tar.gz | itsalive image -` (the pipe shape of
+/// `docs/ARCHITECTURE.md` §8, with the wrong file on the left) or a mistyped
+/// path to something large would pull the whole of it into a 1 GB board's RAM
+/// — and on an installer's tmpfs initramfs that is reclaim, an OOM kill, or
+/// Rust's allocation-failure handler, which under `panic = "abort"` is a
+/// `SIGABRT` rather than one of §7's exit codes. The one byte past the
+/// expectation is what lets [`crate::fb::BlitPlan::check_source_len`] still
+/// see that the source is too long and exit 2 saying so.
+pub fn read_source(path: &str, limit: u64) -> Result<Vec<u8>> {
+    // Saturating because `limit + 1` is only ever "one more than we want";
+    // a limit of `u64::MAX` is not a length any plan produces, and staying at
+    // `u64::MAX` there is the same unbounded read as before rather than a
+    // wrap to zero.
+    let cap = limit.saturating_add(1);
+    let mut bytes = Vec::new();
+    if path == "-" {
+        io::stdin()
+            .lock()
+            .take(cap)
+            .read_to_end(&mut bytes)
+            .map_err(|e| Error::io("read stdin", e))?;
+    } else {
+        File::open(path)
+            .map_err(|e| Error::io(format!("open {path}"), e))?
+            .take(cap)
+            .read_to_end(&mut bytes)
+            .map_err(|e| Error::io(format!("read {path}"), e))?;
+    }
+    Ok(bytes)
 }
 
 // ---------------------------------------------------------------------------
@@ -1572,5 +1791,200 @@ mod tests {
         let erased: &mut dyn I2cBus = &mut bus;
         assert_eq!(write_table(erased, [(0x17, 0x62), (0x3B, 0x40)]), 0);
         assert_eq!(bus.writes, vec![(0x17, 0x62), (0x3B, 0x40)]);
+    }
+
+    // -----------------------------------------------------------------------
+    // Reading the knob back, and /dev/fb0
+    // -----------------------------------------------------------------------
+
+    /// The same file both ways: what [`ModeSink`] wrote is what [`ModeSource`]
+    /// reads.
+    #[test]
+    fn the_mode_knob_reads_back_what_was_written() {
+        let path = scratch("mode-readback");
+        let mut knob = ModeFile::at(&path);
+        knob.write_mode_line("8888 1 1280 720 5120\n").unwrap();
+        assert_eq!(knob.read_mode_line().unwrap(), "8888 1 1280 720 5120\n");
+        knob.write_mode_line("8888 1 640 480 2560\n").unwrap();
+        assert_eq!(knob.read_mode_line().unwrap(), "8888 1 640 480 2560\n");
+        fs::remove_file(&path).unwrap();
+    }
+
+    /// A knob whose driver never probed: `mode_get` returns 0 bytes
+    /// (`MiSTer_fb.c:364-371`), which is an empty read and not an error. The
+    /// grammar, and the message about `fb enable`, belong to
+    /// [`crate::fb::parse_mode_line`].
+    #[test]
+    fn an_empty_knob_reads_as_the_empty_string() {
+        let path = scratch("mode-empty");
+        fs::write(&path, b"").unwrap();
+        assert_eq!(ModeFile::at(&path).read_mode_line().unwrap(), "");
+        assert!(crate::fb::parse_mode_line("").is_err());
+        fs::remove_file(&path).unwrap();
+    }
+
+    /// A knob that cannot be read at all is exit 14, which is the other half
+    /// of the split: unreadable is I/O, unparseable is usage.
+    #[test]
+    fn an_unreadable_mode_knob_is_exit_14() {
+        let err = ModeFile::at("/proc/itsalive/does/not/exist")
+            .read_mode_line()
+            .unwrap_err();
+        assert_eq!(err.exit_code(), 14);
+    }
+
+    /// [`PixelSink::write_at`] seeks first, so two rows written to unrelated
+    /// offsets land where they were addressed and the gap between them is
+    /// untouched.
+    #[test]
+    fn the_pixel_sink_writes_at_the_offset_it_is_given() {
+        let path = scratch("fb");
+        fs::write(&path, vec![0xAAu8; 32]).unwrap();
+        let mut fbdev = FbDevice::at(&path).unwrap();
+        fbdev.write_at(4, b"BGRX").unwrap();
+        fbdev.write_at(20, b"bgrx").unwrap();
+
+        let mut want = vec![0xAAu8; 32];
+        want.splice(4..8, *b"BGRX");
+        want.splice(20..24, *b"bgrx");
+        assert_eq!(fs::read(&path).unwrap(), want);
+        assert_eq!(fbdev.path(), path);
+        fs::remove_file(&path).unwrap();
+    }
+
+    /// Opening the device must not truncate it: a framebuffer is a device
+    /// whose contents are the screen, and a truncating open would blank it
+    /// before the plan had decided anything.
+    #[test]
+    fn opening_the_pixel_sink_keeps_what_is_there() {
+        let path = scratch("fb-notrunc");
+        fs::write(&path, vec![0x5Au8; 16]).unwrap();
+        let _fbdev = FbDevice::at(&path).unwrap();
+        assert_eq!(fs::read(&path).unwrap(), vec![0x5Au8; 16]);
+        fs::remove_file(&path).unwrap();
+    }
+
+    /// `--clear` zeroes exactly `len` bytes and not one more, in page-sized
+    /// writes from the top. The length is `stride * height`, which is the
+    /// driver's own `smem_len` (`MiSTer_fb.c:239`).
+    #[test]
+    fn clearing_zeroes_exactly_the_length_asked_for() {
+        /// A [`PixelSink`] that records `(offset, len)` and applies the bytes.
+        struct Recording {
+            buf: Vec<u8>,
+            writes: Vec<(u64, usize)>,
+        }
+
+        impl PixelSink for Recording {
+            fn write_at(&mut self, offset: u64, bytes: &[u8]) -> Result<()> {
+                self.writes.push((offset, bytes.len()));
+                let at = usize::try_from(offset).unwrap();
+                self.buf
+                    .splice(at..at.saturating_add(bytes.len()), bytes.iter().copied());
+                Ok(())
+            }
+        }
+
+        // Under one page: one write, and the byte past the end survives.
+        let mut sink = Recording {
+            buf: vec![0xFFu8; 100],
+            writes: Vec::new(),
+        };
+        sink.clear(64).unwrap();
+        assert_eq!(sink.writes, vec![(0, 64)]);
+        assert_eq!(sink.buf.get(..64), Some(&[0u8; 64][..]));
+        assert_eq!(sink.buf.get(64), Some(&0xFF), "one byte past `len`");
+
+        // Over one page: whole pages from the top, then the remainder.
+        let mut sink = Recording {
+            buf: vec![0xFFu8; 10_000],
+            writes: Vec::new(),
+        };
+        sink.clear(9000).unwrap();
+        assert_eq!(sink.writes, vec![(0, 4096), (4096, 4096), (8192, 808)]);
+        assert_eq!(sink.buf.get(..9000), Some(&vec![0u8; 9000][..]));
+        assert_eq!(sink.buf.get(9000), Some(&0xFF));
+
+        // Nothing to clear is no writes at all.
+        let mut sink = Recording {
+            buf: vec![0xFFu8; 8],
+            writes: Vec::new(),
+        };
+        sink.clear(0).unwrap();
+        assert!(sink.writes.is_empty());
+    }
+
+    /// A missing `/dev/fb0` is exit 14, not a created file.
+    #[test]
+    fn a_missing_framebuffer_is_exit_14() {
+        let path = scratch("fb-missing");
+        let err = FbDevice::at(&path).unwrap_err();
+        assert_eq!(err.exit_code(), 14);
+        match err {
+            Error::Io { source, .. } => assert_eq!(source.kind(), ErrorKind::NotFound),
+            other => panic!("expected Io, got {other:?}"),
+        }
+        assert!(!path.exists(), "`at` must not create the device");
+    }
+
+    #[test]
+    fn the_framebuffer_defaults_to_dev_fb0() {
+        assert_eq!(FB_DEV_PATH, "/dev/fb0");
+    }
+
+    /// `read_source` reads a whole file, and reports a missing one as exit 14.
+    #[test]
+    fn a_source_file_is_read_whole() {
+        let path = scratch("image-src");
+        let pixels: Vec<u8> = (0..=255u8).cycle().take(4096).collect();
+        fs::write(&path, &pixels).unwrap();
+        let got = read_source(path.to_str().unwrap(), 4096).unwrap();
+        assert_eq!(got, pixels);
+        fs::remove_file(&path).unwrap();
+
+        let missing = scratch("image-src-missing");
+        let err = read_source(missing.to_str().unwrap(), 4096).unwrap_err();
+        assert_eq!(err.exit_code(), 14);
+    }
+
+    /// A source longer than the plan expects stops one byte past it.
+    ///
+    /// That one byte is the whole contract with
+    /// [`crate::fb::BlitPlan::check_source_len`]: it is enough to know the
+    /// source is too long — `zcat rootfs.tar.gz | itsalive image -` — and it
+    /// is the difference between exit 2 and a 1 GB board trying to hold the
+    /// whole of whatever was piped in.
+    #[test]
+    fn a_source_longer_than_the_limit_stops_one_byte_past_it() {
+        let path = scratch("image-src-long");
+        let pixels: Vec<u8> = (0..=255u8).cycle().take(4096).collect();
+        fs::write(&path, &pixels).unwrap();
+
+        // The plan wanted 16 bytes; 17 come back, and the extra one is what
+        // says "longer than 16" rather than "exactly 16".
+        let got = read_source(path.to_str().unwrap(), 16).unwrap();
+        assert_eq!(got.len(), 17);
+        assert_eq!(got[..], pixels[..17]);
+
+        // A source shorter than the limit is still read whole, so the ratio
+        // between the two counts stays diagnostic for the `-pix_fmt bgr24`
+        // case (three quarters of the expected length).
+        let got = read_source(path.to_str().unwrap(), 1 << 20).unwrap();
+        assert_eq!(got, pixels);
+
+        // Exactly the limit reads exactly the file and asks for one more byte
+        // that is not there, which is the success case rather than an error.
+        let got = read_source(path.to_str().unwrap(), 4096).unwrap();
+        assert_eq!(got.len(), 4096);
+
+        fs::remove_file(&path).unwrap();
+    }
+
+    /// The two new traits are object-safe, like the other four, so the CLI can
+    /// hold them as `dyn` if that is ever simpler than another generic.
+    #[test]
+    fn the_new_traits_are_object_safe_too() {
+        let _: Option<&dyn ModeSource> = None;
+        let _: Option<&mut dyn PixelSink> = None;
     }
 }

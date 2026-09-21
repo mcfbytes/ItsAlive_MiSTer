@@ -36,7 +36,7 @@
 //! through [`hw::log`] and `probe`'s findings through [`out`], which drop the
 //! error instead (see [`hw::log`]'s doc for the whole argument).
 
-use itsalive::hw::{I2cBus, ModeSink, TextSink};
+use itsalive::hw::{I2cBus, ModeSink, ModeSource, PixelSink, TextSink};
 use itsalive::mailbox::{Deadline, Mailbox, MonotonicDeadline, Regs};
 use itsalive::video::Modeline;
 use itsalive::{Error, Result, adv7513, fb, hw, mailbox, say, video};
@@ -58,16 +58,28 @@ usage:
   itsalive fb enable [--mode MODE]     point the fabric's frame reader at /dev/fb0
   itsalive fb disable                  hand the display back to the core
   itsalive say [--clear] TEXT...       write TEXT to /dev/tty1 for fbcon to paint
+  itsalive image [--size WxH] [--clear] PATH
+                                       blit a raw BGRX8888 image onto /dev/fb0
   itsalive up [--mode MODE]            hdmi, then fb enable: the installer's one call
   itsalive --help                      this text
 
 MODE is 720p (the default) or 480p.
 
+image takes a file of raw BGRX8888 pixels - four bytes each, blue first - or
+`-` to read them from stdin. --size is the source's own WxH and defaults to the
+whole framebuffer; a smaller source is centred, an odd remainder going right and
+down. There is no scaling and no cropping, so resize on the build host:
+  ffmpeg -i splash.png -vf scale=1280:720 -f rawvideo -pix_fmt bgra splash.raw
+--clear zeroes the framebuffer first, which only matters for a second image:
+`fb enable` blanks it on its way past. Run `fb enable` before `image`; the
+geometry comes from the kernel, not from a flag.
+
 exit codes:
   0   done                      11  mailbox timeout
   2   usage error               12  ADV7513 not found on any i2c bus
   10  no bitstream in the       13  ADV7513 on more than one i2c bus
-      fabric (GPI bit 31)       14  /dev/mem, /dev/i2c-*, sysfs or tty unopenable";
+      fabric (GPI bit 31)       14  /dev/mem, /dev/i2c-*, sysfs, tty
+                                    or /dev/fb0 unopenable";
 
 fn main() -> ExitCode {
     // `std::env::args()` panics on an argument that is not UTF-8, and a panic
@@ -157,6 +169,17 @@ enum Command {
     FbDisable,
     /// `say [--clear] TEXT...`
     Say { clear: bool, text: Vec<String> },
+    /// `image [--size WxH] [--clear] PATH`
+    Image {
+        /// The **source's** own dimensions. `None` means "the whole
+        /// framebuffer", which is only knowable once the kernel's knob has
+        /// been read, so it stays unresolved here.
+        size: Option<(u32, u32)>,
+        /// Zero the framebuffer before blitting.
+        clear: bool,
+        /// The file to read, or `-` for stdin.
+        path: String,
+    },
     /// `up [--mode MODE]`
     Up { mode: Modeline },
     /// `--help`
@@ -276,6 +299,50 @@ fn parse(args: &[String]) -> Result<Command> {
             Ok(Command::Say { clear, text })
         }
 
+        "image" => {
+            // Same shape as `say`: options first, then the positional, with
+            // `--` to end the options so that `itsalive image -- --odd.raw`
+            // can name a file whose first characters are dashes.
+            let mut size = None;
+            let mut clear = false;
+            let mut start = 0usize;
+            while let Some(arg) = rest.get(start) {
+                match arg.as_str() {
+                    "--size" => {
+                        let Some(value) = rest.get(start.saturating_add(1)) else {
+                            return Err(usage("image: --size needs a value, e.g. 320x200"));
+                        };
+                        size = Some(size_value(value)?);
+                        start = start.saturating_add(2);
+                    }
+                    "--clear" => {
+                        clear = true;
+                        start = start.saturating_add(1);
+                    }
+                    "--" => {
+                        start = start.saturating_add(1);
+                        break;
+                    }
+                    other if other.starts_with("--") => {
+                        return Err(usage(format!("image: unknown option {other:?}")));
+                    }
+                    _ => break,
+                }
+            }
+            let positional = rest.get(start..).unwrap_or(&[]);
+            let [path] = positional else {
+                return Err(usage(format!(
+                    "image: expected exactly one path (or `-` for stdin), got {}",
+                    positional.len()
+                )));
+            };
+            Ok(Command::Image {
+                size,
+                clear,
+                path: path.clone(),
+            })
+        }
+
         "up" => {
             let mut mode = video::MODE_720P;
             let mut it = rest.iter();
@@ -299,6 +366,29 @@ fn mode_value(it: &mut std::slice::Iter<'_, String>) -> Result<Modeline> {
     };
     video::mode_by_name(name)
         .ok_or_else(|| usage(format!("unknown mode {name:?}: expected {}", mode_names())))
+}
+
+/// `--size`'s argument: `WxH`, both at least 1.
+///
+/// This declares the **source's** size, not the screen's — the screen's comes
+/// from the kernel (`docs/ARCHITECTURE.md` §5) — and it is parsed here, before
+/// anything is opened, so a typo is exit 2 rather than a half-painted screen.
+/// `x` and `X` are both accepted because `1280X720` is what a spreadsheet or a
+/// shouted shell history produces and rejecting it teaches nobody anything.
+fn size_value(value: &str) -> Result<(u32, u32)> {
+    let malformed = || usage(format!("image: --size {value:?} is not WxH, e.g. 320x200"));
+    let Some((w, h)) = value.split_once(['x', 'X']) else {
+        return Err(malformed());
+    };
+    let (Ok(w), Ok(h)) = (w.parse::<u32>(), h.parse::<u32>()) else {
+        return Err(malformed());
+    };
+    if w == 0 || h == 0 {
+        return Err(usage(format!(
+            "image: --size {value:?} has a zero dimension; both must be at least 1"
+        )));
+    }
+    Ok((w, h))
 }
 
 /// `"720p or 480p"`, built from the table so the message cannot drift from it.
@@ -544,6 +634,110 @@ where
     fb_enable(mb, sink, mode)
 }
 
+/// `image`: read the geometry the kernel reports, plan the blit, paint it.
+///
+/// Four steps, and the order is the point:
+///
+/// 1. **Read the knob back**, and refuse anything that is not `8888` with
+///    `rb = 1` ([`fb::BlitPlan::new`]). Writing the mode line proves nothing —
+///    `mode_set()` returns 0 unconditionally, and its whole body sits inside
+///    `if(p_fbdev)` (`MiSTer_fb.c:343-361`), so on a kernel where `MiSTer_fb`
+///    never probed `fb enable` reports success and changes nothing. The read
+///    is the only evidence Linux has, and it is also where the screen's size
+///    comes from: this command takes no `--mode`, because the driver already
+///    knows and a flag could only disagree with it.
+/// 2. **Plan**, which decides the centring and every refusal, purely.
+/// 3. **Read the source**, capped at one byte past what the plan expects, and
+///    check its length is exactly `w * h * 4`.
+/// 4. **Open `/dev/fb0` and paint**, clearing first if asked.
+///
+/// **What exit 0 means here, and what it does not.** It means those bytes
+/// reached `/dev/fb0` in the layout the driver registered. It does not mean
+/// anything is on a screen: `setup_fb_info()` supplies its own defaults at
+/// probe (`MiSTer_fb.c:150-152`, with `format` rewritten to 8888 at `:227` and
+/// `rb` already 1 at `:31`), so a board where `fb enable` has never run reads
+/// back `8888 1 640 480 2560` and passes every check while the fabric's frame
+/// reader is still on the core's own buffer. The word that settles it is
+/// `UIO_SET_FBUF`'s reply, which `fb enable` has and this command deliberately
+/// does not — `image` opens no `/dev/mem` at all. On the rig, only a
+/// photograph is a pass (`docs/PLAN.md` §3 step 6).
+///
+/// Nothing is opened for writing until every refusal has been decided, so a
+/// bad `--size`, a short file or a framebuffer in the wrong format leaves the
+/// screen exactly as it was rather than half-painted. `/dev/mem` is never
+/// opened at all: the fabric is not involved in a `write(2)` to `/dev/fb0`,
+/// which is why this is the second subcommand after `say` with no bitstream
+/// check (`docs/ARCHITECTURE.md` §7 guards `hdmi`, `fb` and `up`).
+///
+/// The source is fully read before the first pixel goes out, which is what
+/// makes the length check worth having: it is the only thing that catches a
+/// converter run with the wrong `-pix_fmt`, and it cannot run against a stream
+/// that is already half-way down the screen. "Fully" is bounded: the plan
+/// exists before the reader is called, so it can hand over the exact byte
+/// count and the reader stops one byte past it
+/// ([`hw::read_source`]) — enough for [`fb::BlitPlan::check_source_len`] to
+/// say "longer than", and not enough for `zcat rootfs.tar.gz | itsalive
+/// image -` to turn into an allocation failure, which under `panic = "abort"`
+/// is a `SIGABRT` and not a §7 exit code.
+fn image<S, P>(
+    knob: &mut S,
+    source: impl FnOnce(u64) -> Result<Vec<u8>>,
+    pixels: impl FnOnce() -> Result<P>,
+    size: Option<(u32, u32)>,
+    clear: bool,
+) -> Result<()>
+where
+    S: ModeSource + ?Sized,
+    P: PixelSink,
+{
+    let mode = fb::parse_mode_line(&knob.read_mode_line()?)?;
+    // The *visible* width and height, never `stride / 4`: the stride is bytes
+    // a row including whatever padding the driver added (`MiSTer_fb.c:152`),
+    // and painting that many pixels wide would be wider than the screen.
+    let (width, height) = size.unwrap_or((mode.width, mode.height));
+    let plan = fb::BlitPlan::new(&mode, width, height)?;
+
+    // Said once, before any of it is painted: the knob and the frame reader
+    // can disagree about the stride and only the knob is readable.
+    if let Some(warning) = fb::stride_warning(&mode) {
+        hw::log(format_args!("{warning}"));
+    }
+
+    let data = source(plan.source_len())?;
+    plan.check_source_len(data.len() as u64)?;
+
+    let mut sink = pixels()?;
+    if clear {
+        sink.clear(mode.byte_len())?;
+    }
+    for row in plan.rows() {
+        let Some(bytes) = data.get(row.src..row.src.saturating_add(row.len)) else {
+            // Unreachable: `check_source_len` has just proved `data` is
+            // exactly `width * height * 4` bytes and `rows()` partitions
+            // precisely that. It is written out rather than `unwrap`ed because
+            // §6 bans `unwrap` on this path and `panic = "abort"` would turn
+            // it into a SIGABRT instead of a §7 exit code.
+            return Err(usage(format!(
+                "the blit plan ran past the image at row offset {}; this is a bug",
+                row.src
+            )));
+        };
+        sink.write_at(row.dest, bytes)?;
+    }
+
+    hw::log(format_args!(
+        "itsalive: {}x{} image at ({}, {}) in a {}x{} frame buffer, stride {} bytes",
+        plan.width(),
+        plan.height(),
+        plan.x(),
+        plan.y(),
+        mode.width,
+        mode.height,
+        mode.stride
+    ));
+    Ok(())
+}
+
 // ---------------------------------------------------------------------------
 // probe
 // ---------------------------------------------------------------------------
@@ -787,6 +981,8 @@ fn execute(cmd: Command) -> Result<()> {
         hw::I2c::open_adv7513,
         hw::ModeFile::new,
         hw::Tty::open,
+        hw::FbDevice::open,
+        hw::read_source,
         probe_findings,
     )
 }
@@ -813,20 +1009,28 @@ fn execute(cmd: Command) -> Result<()> {
 /// keeps `hdmi`, `fb` and `up` all answering 10 to the same board. The
 /// sequences keep their own check as well: it costs a load, and it is what
 /// makes them self-contained for a direct caller.
-fn dispatch<R, D, B, M, T>(
+///
+/// The parameter list is long because every opener is a parameter; that is the
+/// design and not an accident, so the lint is silenced here rather than two of
+/// them being hidden behind a struct to get under its threshold.
+#[allow(clippy::too_many_arguments)]
+fn dispatch<R, D, B, M, T, P>(
     cmd: Command,
     mailbox: impl FnOnce() -> Result<Mailbox<R, D>>,
     i2c: impl FnOnce() -> Result<B>,
     mode_sink: impl FnOnce() -> M,
     tty: impl FnOnce() -> Result<T>,
+    pixels: impl FnOnce() -> Result<P>,
+    source: impl FnOnce(&str, u64) -> Result<Vec<u8>>,
     findings: impl FnOnce() -> (Vec<Finding>, Option<Error>),
 ) -> Result<()>
 where
     R: Regs,
     D: Deadline,
     B: I2cBus,
-    M: ModeSink,
+    M: ModeSink + ModeSource,
     T: TextSink,
+    P: PixelSink,
 {
     match cmd {
         Command::Help => {
@@ -870,6 +1074,17 @@ where
         Command::Say { clear, text } => {
             let mut tty = tty()?;
             say::say(&mut tty, clear, &text)
+        }
+
+        // The knob is opened first and read before anything else, because it
+        // is what says whether there is a framebuffer to paint at all and what
+        // shape it is. `/dev/fb0` is opened last, inside [`image`], so that no
+        // refusal can leave a half-painted screen.
+        Command::Image { size, clear, path } => {
+            let mut knob = mode_sink();
+            // The reader's cap comes from the plan, which is built inside
+            // [`image`] — hence a closure over the path rather than a call.
+            image(&mut knob, |limit| source(&path, limit), pixels, size, clear)
         }
 
         // One process, one mailbox, one i2c handle (§7's idempotence rule
@@ -916,12 +1131,22 @@ mod tests {
         Word(u16),
         /// One line was written to the sysfs geometry knob.
         ModeLine(String),
+        /// The sysfs geometry knob was read back, and said this.
+        ModeRead(String),
+        /// Bytes were written to `/dev/fb0` at a byte offset.
+        Pixels(u64, Vec<u8>),
         /// Bytes were written to the tty.
         Text(Vec<u8>),
         /// [`dispatch`] called one of its openers: `"mailbox"`, `"i2c"`,
-        /// `"mode"` or `"tty"`. Only the dispatch tests see these; the
-        /// sequence tests call the sequences directly.
+        /// `"mode"`, `"tty"`, `"fb"` or `"source"`. Only the dispatch tests
+        /// see these; the sequence tests call the sequences directly.
         Open(&'static str),
+        /// The byte count `image` handed the source reader — `w * h * 4`,
+        /// the exact length the plan expects — which is what bounds
+        /// [`hw::read_source`]'s allocation. Recorded because a wrong limit
+        /// is invisible in the pixels: too large and a mistyped path still
+        /// aborts the process, and nothing else here would notice.
+        SourceLimit(u64),
     }
 
     type Log = Rc<RefCell<Vec<Event>>>;
@@ -1045,6 +1270,9 @@ mod tests {
     struct FakeMode {
         log: Log,
         fail: bool,
+        /// What `read_mode_line` reports — the driver's answer, not ours.
+        /// Defaults to the 720p line [`fb::mode_param_line`] would write.
+        line: String,
     }
 
     impl FakeMode {
@@ -1052,7 +1280,33 @@ mod tests {
             Self {
                 log: Rc::clone(log),
                 fail: false,
+                line: "8888 1 1280 720 5120\n".to_string(),
             }
+        }
+
+        /// The same knob reporting a geometry of the test's choosing, which
+        /// is how `image` is driven against a framebuffer small enough to
+        /// write out byte for byte.
+        fn reporting(log: &Log, line: &str) -> Self {
+            Self {
+                line: line.to_string(),
+                ..Self::new(log)
+            }
+        }
+    }
+
+    impl ModeSource for FakeMode {
+        fn read_mode_line(&mut self) -> Result<String> {
+            if self.fail {
+                return Err(Error::io(
+                    "read /sys/module/MiSTer_fb/parameters/mode",
+                    std::io::Error::from_raw_os_error(libc::ENOENT),
+                ));
+            }
+            self.log
+                .borrow_mut()
+                .push(Event::ModeRead(self.line.clone()));
+            Ok(self.line.clone())
         }
     }
 
@@ -1078,6 +1332,23 @@ mod tests {
     impl TextSink for FakeTty {
         fn write_text(&mut self, bytes: &[u8]) -> Result<()> {
             self.log.borrow_mut().push(Event::Text(bytes.to_vec()));
+            Ok(())
+        }
+    }
+
+    /// A recording [`PixelSink`]: every `(offset, bytes)` the blit produced,
+    /// in order. `clear` is [`PixelSink`]'s provided method, so its zero
+    /// writes land in the same list and in the same place they would on the
+    /// real device.
+    struct FakePixels {
+        log: Log,
+    }
+
+    impl PixelSink for FakePixels {
+        fn write_at(&mut self, offset: u64, bytes: &[u8]) -> Result<()> {
+            self.log
+                .borrow_mut()
+                .push(Event::Pixels(offset, bytes.to_vec()));
             Ok(())
         }
     }
@@ -1636,6 +1907,28 @@ mod tests {
         bus: Result<FakeBus>,
         findings: (Vec<Finding>, Option<Error>),
     ) -> Result<()> {
+        run_dispatch_with(
+            cmd,
+            log,
+            regs,
+            bus,
+            findings,
+            FakeMode::new(log),
+            Vec::new(),
+        )
+    }
+
+    /// [`run_dispatch`] with the knob's answer and the image bytes chosen by
+    /// the caller, which is what the `image` tests need.
+    fn run_dispatch_with(
+        cmd: Command,
+        log: &Log,
+        regs: FakeRegs,
+        bus: Result<FakeBus>,
+        findings: (Vec<Finding>, Option<Error>),
+        mode: FakeMode,
+        mut source: Vec<u8>,
+    ) -> Result<()> {
         dispatch(
             cmd,
             || {
@@ -1648,13 +1941,29 @@ mod tests {
             },
             || {
                 log.borrow_mut().push(Event::Open("mode"));
-                FakeMode::new(log)
+                mode
             },
             || {
                 log.borrow_mut().push(Event::Open("tty"));
                 Ok(FakeTty {
                     log: Rc::clone(log),
                 })
+            },
+            || {
+                log.borrow_mut().push(Event::Open("fb"));
+                Ok(FakePixels {
+                    log: Rc::clone(log),
+                })
+            },
+            |_path, limit| {
+                log.borrow_mut().push(Event::Open("source"));
+                log.borrow_mut().push(Event::SourceLimit(limit));
+                // The fake honours the cap the way `hw::read_source`'s
+                // `take(limit + 1)` does, so what the tests below assert is
+                // the reader's real behaviour and not a friendlier one.
+                let cap = usize::try_from(limit.saturating_add(1)).unwrap_or(usize::MAX);
+                source.truncate(cap);
+                Ok(source)
             },
             || findings,
         )
@@ -1918,10 +2227,23 @@ mod tests {
     /// `leds` is v1.1 (`docs/ARCHITECTURE.md` §7) and must not be advertised.
     #[test]
     fn the_usage_text_matches_the_implemented_commands() {
-        for name in ["probe", "hdmi", "fb enable", "fb disable", "say", "up"] {
+        for name in [
+            "probe",
+            "hdmi",
+            "fb enable",
+            "fb disable",
+            "say",
+            "image",
+            "up",
+        ] {
             assert!(USAGE.contains(name), "usage does not mention {name}");
         }
         assert!(!USAGE.contains("leds"));
+        // `image`'s two traps are in the usage text, not only in the docs: the
+        // byte order, and that there is no scaling.
+        assert!(USAGE.contains("BGRX8888"));
+        assert!(USAGE.contains("blue first"));
+        assert!(USAGE.contains("no scaling"));
         for (name, _) in video::MODES {
             assert!(USAGE.contains(name), "usage does not mention mode {name}");
         }
@@ -2269,5 +2591,438 @@ mod tests {
             render_json(&findings, 0),
             "{\"findings\":[{\"name\":\"bitstream\",\"ok\":true,\"detail\":\"fabric in user mode\",\"exit_code\":0}],\"exit_code\":0}"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // image: end to end over a framebuffer small enough to write out
+    // -----------------------------------------------------------------------
+
+    /// A knob reporting a 9x5 screen with a **padded** stride.
+    ///
+    /// Three things are deliberate about those numbers.
+    ///
+    /// *The stride is 256, not 36.* It is what the driver's own rule produces
+    /// for a 9-pixel row — `if(!stride) stride = (width*4 + 255) & ~255;`
+    /// (`MiSTer_fb.c:152`), and `(36 + 255) & ~255 = 256` — and it is the only
+    /// way this test can tell stride-addressing from `width * 4` addressing,
+    /// which for every geometry `itsalive fb enable` writes are the same
+    /// number.
+    ///
+    /// *Both dimensions are odd against a 2x2 source*, so the slack is 7
+    /// across and 3 down and the integer division has a remainder in both
+    /// axes: rounding either one the other way moves the picture.
+    ///
+    /// *The two are different*, so transposing `x` and `y` moves it too.
+    const PADDED_9X5: &str = "8888 1 9 5 256\n";
+
+    /// Four pixels, one per corner of a 2x2, in the layout
+    /// [`fb::FbMode`] documents: **B, G, R, X**, blue first.
+    ///
+    /// Written as pixels rather than as sixteen loose bytes so that the
+    /// assertion below says what the picture is, not only what the bytes are.
+    fn bgrx_2x2() -> Vec<u8> {
+        let mut src = Vec::new();
+        src.extend([0xFF, 0x00, 0x00, 0x00]); // top left, pure blue
+        src.extend([0x00, 0xFF, 0x00, 0x00]); // top right, pure green
+        src.extend([0x00, 0x00, 0xFF, 0x00]); // bottom left, pure red
+        src.extend([0xFF, 0xFF, 0xFF, 0x00]); // bottom right, white
+        src
+    }
+
+    /// Run `image` through [`dispatch`], with the knob and the source bytes
+    /// the test chose.
+    fn run_image(
+        log: &Log,
+        knob: &str,
+        source: Vec<u8>,
+        size: Option<(u32, u32)>,
+        clear: bool,
+    ) -> Result<()> {
+        let (regs, bus, findings) = healthy(log);
+        run_dispatch_with(
+            Command::Image {
+                size,
+                clear,
+                path: "splash.raw".to_string(),
+            },
+            log,
+            regs,
+            bus,
+            findings,
+            FakeMode::reporting(log, knob),
+            source,
+        )
+    }
+
+    /// T-image's "Done when": a 2x2 lands centred, at the byte offsets the
+    /// reported stride gives, with its bytes unchanged and its rows in order.
+    ///
+    /// 9 - 2 = 7, so `x = 7 / 2 = 3` and the spare column is on the right;
+    /// 5 - 2 = 3, so `y = 3 / 2 = 1` and the spare row is at the bottom. Row 0
+    /// therefore goes to `1 * 256 + 3 * 4 = 268` and row 1 to
+    /// `2 * 256 + 3 * 4 = 524`. Every one of those numbers is spelled out
+    /// rather than recomputed, so that the composer and the test cannot drift
+    /// together.
+    #[test]
+    fn image_blits_a_2x2_to_the_centre_of_the_frame_buffer() {
+        let log = log_new();
+        run_image(&log, PADDED_9X5, bgrx_2x2(), Some((2, 2)), false).unwrap();
+
+        assert_eq!(
+            events(&log),
+            vec![
+                // The knob is opened and read before anything else, because
+                // it is what says whether there is anything to paint.
+                Event::Open("mode"),
+                Event::ModeRead(PADDED_9X5.to_string()),
+                // Then the source, then the device: `/dev/fb0` is opened last
+                // so that no refusal leaves a half-painted screen.
+                Event::Open("source"),
+                // 2 * 2 * 4: the reader is told exactly what the plan needs.
+                Event::SourceLimit(16),
+                Event::Open("fb"),
+                // Row 0 of the source at (3, 1): 1 * 256 + 3 * 4.
+                Event::Pixels(268, vec![0xFF, 0x00, 0x00, 0x00, 0x00, 0xFF, 0x00, 0x00]),
+                // Row 1 at (3, 2): 2 * 256 + 3 * 4.
+                Event::Pixels(524, vec![0x00, 0x00, 0xFF, 0x00, 0xFF, 0xFF, 0xFF, 0x00]),
+            ]
+        );
+    }
+
+    /// `--clear` zeroes the whole framebuffer **first**, and the whole of it
+    /// is `stride * height` — the driver's own `smem_len`
+    /// (`MiSTer_fb.c:239`), 256 * 5 = 1280 here, not `width * height * 4`,
+    /// which for this geometry would be 180 and would leave almost all of the
+    /// previous picture on the screen.
+    #[test]
+    fn image_clear_zeroes_the_whole_frame_buffer_before_painting() {
+        let log = log_new();
+        run_image(&log, PADDED_9X5, bgrx_2x2(), Some((2, 2)), true).unwrap();
+
+        assert_eq!(
+            events(&log),
+            vec![
+                Event::Open("mode"),
+                Event::ModeRead(PADDED_9X5.to_string()),
+                Event::Open("source"),
+                Event::SourceLimit(16),
+                Event::Open("fb"),
+                // stride * height, in one page-sized write from the top.
+                Event::Pixels(0, vec![0u8; 1280]),
+                Event::Pixels(268, vec![0xFF, 0x00, 0x00, 0x00, 0x00, 0xFF, 0x00, 0x00]),
+                Event::Pixels(524, vec![0x00, 0x00, 0xFF, 0x00, 0xFF, 0xFF, 0xFF, 0x00]),
+            ]
+        );
+    }
+
+    /// With no `--size`, the source is the whole screen and starts at 0.
+    #[test]
+    fn image_without_a_size_fills_the_frame_buffer() {
+        let log = log_new();
+        // 4x2 with the stride equal to the row, which is what `fb enable`
+        // writes: two rows of 16 bytes.
+        let source: Vec<u8> = (0..32u8).collect();
+        run_image(&log, "8888 1 4 2 16\n", source, None, false).unwrap();
+
+        assert_eq!(
+            events(&log),
+            vec![
+                Event::Open("mode"),
+                Event::ModeRead("8888 1 4 2 16\n".to_string()),
+                Event::Open("source"),
+                // The whole screen: 4 * 2 * 4.
+                Event::SourceLimit(32),
+                Event::Open("fb"),
+                Event::Pixels(0, (0..16u8).collect()),
+                Event::Pixels(16, (16..32u8).collect()),
+            ]
+        );
+    }
+
+    /// With no `--size` against a **padded** knob, the source is the visible
+    /// width — not `stride / 4`.
+    ///
+    /// The only other no-`--size` test has `stride == width * 4`, where the
+    /// two are the same number and deriving the default from the stride would
+    /// be invisible. Here they differ: a 3x2 screen with the driver's 256-byte
+    /// stride takes 12 bytes a row from the source and steps 256 between rows,
+    /// where `stride / 4` would ask for a 64-pixel-wide source and refuse a
+    /// correct `itsalive image splash.raw` with "does not scale and does not
+    /// crop".
+    #[test]
+    fn image_without_a_size_takes_the_visible_width_not_the_stride() {
+        let log = log_new();
+        let source: Vec<u8> = (0..24u8).collect();
+        run_image(&log, "8888 1 3 2 256\n", source, None, false).unwrap();
+
+        assert_eq!(
+            events(&log),
+            vec![
+                Event::Open("mode"),
+                Event::ModeRead("8888 1 3 2 256\n".to_string()),
+                Event::Open("source"),
+                // 3 * 2 * 4 — the visible width, not 256 / 4 * 2 * 4.
+                Event::SourceLimit(24),
+                Event::Open("fb"),
+                // 3 pixels = 12 bytes a row, from (0, 0) because the source
+                // is the whole screen.
+                Event::Pixels(0, (0..12u8).collect()),
+                // One stride later, not one row of pixels later.
+                Event::Pixels(256, (12..24u8).collect()),
+            ]
+        );
+    }
+
+    /// A source longer than the plan expects is exit 2, and the reader never
+    /// sees more than one byte past the expectation.
+    ///
+    /// This is `zcat rootfs.tar.gz | itsalive image -`, or a mistyped path to
+    /// something large. The plan is built before the reader is called, so the
+    /// limit is known; without it the whole of the wrong file would have to
+    /// fit in a 1 GB board's RAM to be diagnosed, and the allocation failure
+    /// that follows is a `SIGABRT` under `panic = "abort"`, not a §7 code.
+    #[test]
+    fn an_oversize_source_is_refused_without_being_read_whole() {
+        let log = log_new();
+        // A 2x2 plan wants 16 bytes; offer 64 KiB of them.
+        let err = run_image(&log, PADDED_9X5, vec![0xABu8; 65536], Some((2, 2)), false)
+            .expect_err("64 KiB is not a 2x2 BGRX image");
+        assert_eq!(err.exit_code(), 2);
+        let msg = err.to_string();
+        assert!(msg.contains("longer than 16 bytes"), "{msg:?}");
+
+        // The reader was told 16, so it stopped at 17 of the 65536 bytes on
+        // offer, and `/dev/fb0` was never opened.
+        assert_eq!(
+            events(&log),
+            vec![
+                Event::Open("mode"),
+                Event::ModeRead(PADDED_9X5.to_string()),
+                Event::Open("source"),
+                Event::SourceLimit(16),
+            ]
+        );
+    }
+
+    /// Every refusal happens **before `/dev/fb0` is opened**, so a screen that
+    /// is already showing something keeps showing it.
+    ///
+    /// The failing inputs, and what each one is in the field:
+    ///
+    /// - an empty or short knob: `image` run before `fb enable`, or a kernel
+    ///   where `MiSTer_fb` never probed, which `mode_get` reports as 0 bytes
+    ///   (`MiSTer_fb.c:364-371`);
+    /// - `rb = 0`: a framebuffer whose pixels are R, G, B, X rather than
+    ///   B, G, R, X (`MiSTer_fb.c:230-234`) — the one that would otherwise
+    ///   paint happily with red and blue exchanged and no error anywhere;
+    /// - a format that is not `8888`: a different pixel size entirely;
+    /// - a source bigger than the screen, which this command will not scale.
+    ///
+    /// All of them are exit 2 (`docs/ARCHITECTURE.md` §7's usage error), and
+    /// none of them reaches [`hw::FbDevice`].
+    #[test]
+    fn every_geometry_refusal_comes_before_the_device_is_opened() {
+        let cases = [
+            ("an unset knob", "", Some((2, 2)), "fb enable"),
+            ("a short knob", "8888 1 8 4\n", Some((2, 2)), "fb enable"),
+            (
+                "red and blue not swapped",
+                "8888 0 8 4 256\n",
+                Some((2, 2)),
+                "rb 0",
+            ),
+            (
+                "a 16-bit frame buffer",
+                "565 1 8 4 256\n",
+                Some((2, 2)),
+                "format 565",
+            ),
+            (
+                "a source wider than the screen",
+                PADDED_9X5,
+                Some((16, 2)),
+                "16x2",
+            ),
+        ];
+
+        for (what, knob, size, needle) in cases {
+            let log = log_new();
+            let err = match run_image(&log, knob, bgrx_2x2(), size, false) {
+                Ok(()) => panic!("{what} should have been refused"),
+                Err(err) => err,
+            };
+            assert_eq!(err.exit_code(), 2, "{what}");
+            assert!(
+                err.to_string().contains(needle),
+                "{what}: {:?} does not mention {needle:?}",
+                err.to_string()
+            );
+            // The knob was read; nothing else was even opened.
+            assert!(
+                !events(&log).contains(&Event::Open("fb")),
+                "{what} opened /dev/fb0"
+            );
+        }
+    }
+
+    /// A source of the wrong length is refused after it has been read — it
+    /// has to be, the length is the thing being checked — but still before
+    /// `/dev/fb0` is opened, and the message carries **both** byte counts.
+    ///
+    /// 12 bytes for a 2x2 is the `-pix_fmt bgr24` mistake: three bytes a pixel
+    /// instead of four. The ratio is what names it, which is why the numbers
+    /// are in the message rather than a verdict.
+    #[test]
+    fn a_source_of_the_wrong_length_is_refused_with_both_counts() {
+        let log = log_new();
+        let three_bytes_a_pixel: Vec<u8> = (0..12u8).collect();
+        let err = run_image(&log, PADDED_9X5, three_bytes_a_pixel, Some((2, 2)), false)
+            .expect_err("12 bytes is not a 2x2 BGRX image");
+
+        assert_eq!(err.exit_code(), 2);
+        let msg = err.to_string();
+        assert!(msg.contains("12"), "{msg:?}");
+        assert!(msg.contains("16"), "{msg:?}");
+
+        assert_eq!(
+            events(&log),
+            vec![
+                Event::Open("mode"),
+                Event::ModeRead(PADDED_9X5.to_string()),
+                Event::Open("source"),
+                Event::SourceLimit(16),
+            ],
+            "the source was read, the device was not opened"
+        );
+    }
+
+    /// A knob that cannot be read at all is exit 14, not exit 2: unreadable
+    /// is I/O, unparseable is the caller's problem.
+    #[test]
+    fn an_unreadable_knob_is_exit_14() {
+        let log = log_new();
+        let (regs, bus, findings) = healthy(&log);
+        let mut knob = FakeMode::new(&log);
+        knob.fail = true;
+        let err = run_dispatch_with(
+            Command::Image {
+                size: Some((2, 2)),
+                clear: false,
+                path: "splash.raw".to_string(),
+            },
+            &log,
+            regs,
+            bus,
+            findings,
+            knob,
+            bgrx_2x2(),
+        )
+        .expect_err("an unreadable knob is an error");
+        assert_eq!(err.exit_code(), 14);
+    }
+
+    /// `image` writes pixels to a kernel device and touches the fabric not at
+    /// all, so it opens neither `/dev/mem` nor an i2c bus — the same rule
+    /// `say` follows, and for the same reason (§8: nothing in the installer
+    /// may fail an install over a device it did not need).
+    #[test]
+    fn image_dispatches_without_the_fabric_or_the_bus() {
+        let log = log_new();
+        run_image(&log, PADDED_9X5, bgrx_2x2(), Some((2, 2)), false).unwrap();
+        let opened: Vec<&str> = events(&log)
+            .iter()
+            .filter_map(|e| match e {
+                Event::Open(what) => Some(*what),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(opened, vec!["mode", "source", "fb"]);
+    }
+
+    // -----------------------------------------------------------------------
+    // image: arguments
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn image_parses_its_options_and_exactly_one_path() {
+        assert_eq!(
+            parse_ok(&["image", "splash.raw"]),
+            Command::Image {
+                size: None,
+                clear: false,
+                path: "splash.raw".to_string()
+            }
+        );
+        // `-` is stdin, which is what makes `zcat x.gz | itsalive image -`
+        // work in an initramfs with no room to land the raw file.
+        assert_eq!(
+            parse_ok(&["image", "-"]),
+            Command::Image {
+                size: None,
+                clear: false,
+                path: "-".to_string()
+            }
+        );
+        assert_eq!(
+            parse_ok(&["image", "--size", "320x200", "--clear", "a.raw"]),
+            Command::Image {
+                size: Some((320, 200)),
+                clear: true,
+                path: "a.raw".to_string()
+            }
+        );
+        // Order of the options does not matter, and `X` is accepted too.
+        assert_eq!(
+            parse_ok(&["image", "--clear", "--size", "1280X720", "a.raw"]),
+            Command::Image {
+                size: Some((1280, 720)),
+                clear: true,
+                path: "a.raw".to_string()
+            }
+        );
+        // `--` ends the options, so a file really called `--clear` is nameable.
+        assert_eq!(
+            parse_ok(&["image", "--", "--clear"]),
+            Command::Image {
+                size: None,
+                clear: false,
+                path: "--clear".to_string()
+            }
+        );
+        // A single dash inside a name is not an option.
+        assert_eq!(
+            parse_ok(&["image", "-x.raw"]),
+            Command::Image {
+                size: None,
+                clear: false,
+                path: "-x.raw".to_string()
+            }
+        );
+    }
+
+    /// Everything a mistyped `image` line can be is exit 2, decided before any
+    /// device is opened.
+    #[test]
+    fn image_rejects_a_bad_size_or_the_wrong_number_of_paths() {
+        for args in [
+            &["image"][..],
+            &["image", "--clear"],
+            &["image", "a.raw", "b.raw"],
+            &["image", "--size"],
+            &["image", "--size", "a.raw"],
+            &["image", "--size", "320", "a.raw"],
+            &["image", "--size", "320x", "a.raw"],
+            &["image", "--size", "x200", "a.raw"],
+            &["image", "--size", "320x200x2", "a.raw"],
+            &["image", "--size", "320 200", "a.raw"],
+            &["image", "--size", "0x200", "a.raw"],
+            &["image", "--size", "320x0", "a.raw"],
+            &["image", "--size", "-1x200", "a.raw"],
+            // There is no `--mode`: the geometry comes from the driver.
+            &["image", "--mode", "720p", "a.raw"],
+            &["image", "--quiet", "a.raw"],
+        ] {
+            parse_usage(args);
+        }
     }
 }
