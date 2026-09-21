@@ -16,7 +16,7 @@ complaint.
 Linux MiSTer 7.2.6 #1 SMP PREEMPT_RT Fri Sep  4 15:16:40 UTC 2026 armv7l GNU/Linux
 ```
 
-DE10-Nano at `192.168.0.160`. `/` is `/dev/loop0` ext4; `/media/fat` is
+A DE10-Nano on the LAN, reached over SSH. `/` is `/dev/loop0` ext4; `/media/fat` is
 `/dev/mmcblk0p1` exfat. `/lib/ld-linux-armhf.so.3` is present, so this is the
 **glibc** installed system, not the installer's musl initramfs — see §8.
 

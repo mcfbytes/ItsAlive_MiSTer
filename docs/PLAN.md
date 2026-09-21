@@ -156,10 +156,9 @@ centring on hardware (6c), `say` after `image` (6d), `image` before
 in full because those four still need running, and because a second board or a
 second core reruns all of it.
 
-Rig: the DE10-Nano at `192.168.0.160` (`mister.lan`), SSH key
-`mister_rig_ed25519`, serial console available, netconsole receiver on
-`ubuntu01`. Runs from the *installed* system, which already has the menu
-core in the fabric:
+Rig: a DE10-Nano on the LAN, reachable over SSH as root, with a serial console
+and a netconsole receiver available. Runs from the *installed* system, which
+already has the menu core in the fabric:
 
 1. Copy the cross-built `itsalive` to `/tmp` on the rig (not to the exFAT
    card; nothing persists).

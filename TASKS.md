@@ -14,8 +14,9 @@ House rules for every task:
   transcribed constant or table.
 - `libc` is the only dependency. `cargo clippy -- -D warnings` and
   `cargo fmt --check` are part of "done".
-- Commit messages: imperative subject, a body that says why, and the
-  `Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>` trailer.
+- Commit messages: imperative subject, a body that says why, and a
+  `Co-Authored-By: Claude <model> <noreply@anthropic.com>` trailer naming the
+  model that actually wrote the commit.
 
 ## Phase 0 — skeleton
 

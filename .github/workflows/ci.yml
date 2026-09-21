@@ -2,6 +2,18 @@
 # Deliberately Docker-free: the gnueabihf link uses Ubuntu's cross gcc and the
 # musl link uses the LLVM linker rustup already ships, so `cross` is not a
 # dependency. See .cargo/config.toml.
+#
+# There is deliberately no `RUSTFLAGS: -D warnings` in `env:` here, and it must
+# not be reintroduced. Cargo picks the *first* source of rustflags it finds and
+# does not concatenate them, so a RUSTFLAGS in the environment silently discards
+# `target.armv7-unknown-linux-musleabihf.rustflags` from .cargo/config.toml --
+# that is, `-C target-feature=+crt-static -C link-self-contained=yes` never
+# reach the compiler, and CI stops building what a developer builds. The musl
+# target happens to default to crt-static, so this costs nothing visible today
+# and would go on costing nothing visible right up until the default changed.
+# Warnings are denied per-invocation with `clippy -- -D warnings` instead, which
+# is passed through to the driver *in addition to* the config rustflags rather
+# than in place of them.
 name: ci
 
 on:
@@ -15,7 +27,6 @@ permissions:
 
 env:
   CARGO_TERM_COLOR: always
-  RUSTFLAGS: -D warnings
 
 jobs:
   host:
@@ -28,19 +39,28 @@ jobs:
           rustup show active-toolchain || rustup toolchain install
           rustup component add clippy rustfmt
       - run: cargo fmt --all --check
-      - run: cargo clippy --all-targets -- -D warnings
-      - run: cargo test --all-targets
+      - run: cargo clippy --locked --all-targets -- -D warnings
+      - run: cargo test --locked --all-targets
       # `cargo test` skips doc tests when --all-targets is given.
-      - run: cargo test --doc
-      # tests/golden/pll.json is the output of compiling Main_MiSTer's PLL
-      # functions (tests/golden/pll.c) and running them. Nothing in the cargo
-      # build compiles that C, so without this step a pll.json edited by hand
-      # to agree with a broken solver would stay green -- exactly the tautology
-      # the golden harness exists to prevent. gen.sh rewrites the file in
-      # place, so a drift of any kind fails the diff. ubuntu-latest ships cc.
+      - run: cargo test --locked --doc
+
+      # The golden vectors are the output of compiling Main_MiSTer's own
+      # functions and running them: tests/golden/pll.c for the PLL solver and
+      # tests/golden/adv7513.cpp for the 92 register writes. Nothing in the
+      # cargo build compiles that C, so without these steps a .json edited by
+      # hand to agree with a broken transcription would stay green -- exactly
+      # the tautology the golden harness exists to prevent. Both generators
+      # rewrite their file in place, so a drift of any kind fails the diff.
+      # ubuntu-latest ships cc and c++.
+      #
+      # Both are checked. adv7513.json is the larger and more error-prone of
+      # the two -- 92 registers against the PLL's handful -- and for a while it
+      # was the one not checked here.
       - name: The golden vectors must still be what the C prints
-        run: tests/golden/gen.sh
-      - run: git diff --exit-code tests/golden/pll.json
+        run: |
+          tests/golden/gen.sh
+          tests/golden/adv7513-gen.sh
+      - run: git diff --exit-code tests/golden/
 
   arm:
     name: build ${{ matrix.target }}
@@ -56,13 +76,19 @@ jobs:
       - name: Install the pinned toolchain
         run: |
           rustup show active-toolchain || rustup toolchain install
+          rustup component add clippy
           rustup target add ${{ matrix.target }}
       - name: Install the cross linker
         if: matrix.target == 'armv7-unknown-linux-gnueabihf'
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends gcc-arm-linux-gnueabihf
-      - run: cargo build --release --target ${{ matrix.target }}
+      # Lint on the target, not just on the host. src/hw.rs is the reason:
+      # libc::Ioctl is c_ulong on gnueabihf and c_int on musleabihf, and
+      # libc::off_t is 32-bit on one and 64-bit on the other, so the host job
+      # above compiles neither of the arms that actually ship.
+      - run: cargo clippy --locked --target ${{ matrix.target }} --all-targets -- -D warnings
+      - run: cargo build --locked --release --target ${{ matrix.target }}
       - name: Check the musl build really is static
         if: matrix.target == 'armv7-unknown-linux-musleabihf'
         run: |
