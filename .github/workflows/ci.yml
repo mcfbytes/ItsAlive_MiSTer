@@ -32,6 +32,15 @@ jobs:
       - run: cargo test --all-targets
       # `cargo test` skips doc tests when --all-targets is given.
       - run: cargo test --doc
+      # tests/golden/pll.json is the output of compiling Main_MiSTer's PLL
+      # functions (tests/golden/pll.c) and running them. Nothing in the cargo
+      # build compiles that C, so without this step a pll.json edited by hand
+      # to agree with a broken solver would stay green -- exactly the tautology
+      # the golden harness exists to prevent. gen.sh rewrites the file in
+      # place, so a drift of any kind fails the diff. ubuntu-latest ships cc.
+      - name: The golden vectors must still be what the C prints
+        run: tests/golden/gen.sh
+      - run: git diff --exit-code tests/golden/pll.json
 
   arm:
     name: build ${{ matrix.target }}

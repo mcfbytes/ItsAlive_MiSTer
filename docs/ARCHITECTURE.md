@@ -112,7 +112,7 @@ The `0x8000` bit Main sometimes ORs into word 9 is gated on
 set it.** Note the even entries contribute two words each, so the burst is
 8 + 6 + 12 = 26 payload words.
 
-PLL block (`setPLL()`, `video.cpp:302-315`), for a target pixel clock `Fout`
+PLL block (`setPLL()`, `video.cpp:301-314`), for a target pixel clock `Fout`
 MHz from a 50 MHz reference:
 
 ```
@@ -126,10 +126,22 @@ item[19] = 7            item[20] = K   (fractional, 32-bit; 1 when K == 0)
 
 where `findPLLpar()` (`video.cpp:224`) searches for integer `C`, `M` and
 fractional `K` with `Fvco = 50 * (M + K)` in the PLL's legal range and
-`Fpix = Fvco / C`, falling back to the loop at `video.cpp:273-292`, and
+`Fpix = Fvco / C`, falling back to the loop at `video.cpp:273-291`, and
 `getPLLdiv()` (`video.cpp:218`) packs a divider into the high/low-count form
 the reconfig block wants. Transcribe all three functions exactly; they are
 pure arithmetic and get golden-vector tests.
+
+**One deviation, and it is a refusal rather than a different number.**
+`while ((Fout*c) < 400) c++;` (`video.cpp:227` and again at `:275`) has no
+exit for an `Fout` whose product can never reach 400 MHz: `c` runs past
+`UINT32_MAX`, wraps, and the loop spins for ever. Upstream is safe without a
+guard because every call site hands it a `vmodes[]` row's `Fpix`; ours is a
+public function, and §2's rule is that a search which cannot finish is an
+error and never a hang. So the solver bounds `C` at 510 — the largest divider
+`getPLLdiv()`'s two 8-bit half-counts can carry, `400 / 510` being 0.78 MHz
+and no video mode — and reports "no solution" for anything below that, for a
+non-finite `Fout` and for zero or negative. Every clock the C solves is
+solved bit for bit identically; that is what the golden vectors check.
 
 **Sync polarity of preset modes is zero on the wire.** `vmodes[]` rows carry
 timings, `Fpix`, VIC and a pixel-repeat flag only; `hpol`/`vpol` are set

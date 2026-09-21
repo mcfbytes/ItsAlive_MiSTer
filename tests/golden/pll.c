@@ -3,7 +3,7 @@
  *
  * getPLLdiv(), findPLLpar() and setPLL() below are transcribed verbatim from
  * Main_MiSTer's video.cpp at upstream commit 6cda9cc -- lines 218-222, 224-260
- * and 262-318 respectively.  The only edits are:
+ * and 262-315 respectively.  The only edits are:
  *
  *   - the printf() tracing and the PROFILE_FUNCTION() macro are gone;
  *   - vmode_custom_t is reduced to the union member setPLL() actually writes
@@ -78,7 +78,7 @@ static int findPLLpar(double Fout, uint32_t *pc, uint32_t *pm, double *pko)
 /* Added: setPLL()'s locals, so main() can print C, M and K. */
 static uint32_t g_c, g_m, g_k;
 
-/* video.cpp:262-318 */
+/* video.cpp:262-315 */
 static void setPLL(double Fout, vmode_custom_t *v)
 {
 	double Fpix;
@@ -135,17 +135,34 @@ static void setPLL(double Fout, vmode_custom_t *v)
 
 /*
  * 74.25 and 25.175 are the two modes itsalive ships (vmodes[0] and vmodes[6],
- * video.cpp:127 and :133).  The rest are other pixel clocks from vmodes[] and
- * exist only to give the transcription more surface to be wrong on.
+ * video.cpp:127 and :133).  65, 27, 108 and 148.5 are other pixel clocks from
+ * vmodes[] and exist only to give the transcription more surface to be wrong
+ * on -- but all six are solved by findPLLpar()'s *first* candidate C, with a
+ * non-zero ko, so on their own they leave most of the search untested.  The
+ * last three are chosen to walk the paths the first six never enter:
+ *
+ *   40      vmodes[5] (800x600@60, video.cpp:132).  C = 10 gives Fvco exactly
+ *           400, so ko is 0: the `if (ko && ...)` guard at video.cpp:238 is
+ *           the only reason this is accepted at all, and it is the one rate
+ *           whose K is the literal 1 of video.cpp:293 rather than a fraction.
+ *   20.001  the first candidate's ko is 0.0004, inside the forbidden band, so
+ *           findPLLpar takes the `c++` retry at video.cpp:247 once.
+ *   49.92   every candidate from C = 9 up has ko >= 0.95f, so findPLLpar runs
+ *           out of range and returns 0 (video.cpp:241-245) after 22 retries.
+ *           setPLL's fallback then takes the `ko >= 0.95f` arm, including the
+ *           carry into M at video.cpp:288.
+ *
+ * None of the last three is a mode itsalive ships; they are here as coverage
+ * of the transcription, and the values are still whatever the C prints.
  */
-static const double rates[] = { 74.25, 25.175, 65, 27, 108, 148.5 };
+static const double rates[] = { 74.25, 25.175, 65, 27, 108, 148.5, 40, 20.001, 49.92 };
 #define NRATES (sizeof(rates) / sizeof(rates[0]))
 
 int main(void)
 {
 	printf("{\n");
 	printf("  \"generator\": \"tests/golden/gen.sh\",\n");
-	printf("  \"source\": \"Main_MiSTer video.cpp @ 6cda9cc: getPLLdiv :218-222, findPLLpar :224-260, setPLL :262-318\",\n");
+	printf("  \"source\": \"Main_MiSTer video.cpp @ 6cda9cc: getPLLdiv :218-222, findPLLpar :224-260, setPLL :262-315\",\n");
 	printf("  \"rows\": [\n");
 
 	for (unsigned r = 0; r < NRATES; r++)

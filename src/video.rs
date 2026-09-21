@@ -151,22 +151,25 @@ impl PllBlock {
     /// The `set_video()` loop switches on the C index's parity, so the
     /// composer works in C indices and converts here.
     ///
-    /// # Panics
-    ///
-    /// Panics if `i` is outside `9..=20`. Every call site is a literal range
-    /// in this module.
-    pub fn c_item(&self, i: usize) -> u32 {
+    /// Private on purpose. `i - 9` underflows for `i < 9`: a panic in a debug
+    /// build, an out-of-bounds index in a release one, and with
+    /// `panic = "abort"` a SIGABRT whose exit code is not one
+    /// `docs/ARCHITECTURE.md` §7 lists. The only call sites are
+    /// [`set_video_words`]'s literal `9..21` and this module's tests, so the
+    /// index is checkable by reading this file; callers outside it get
+    /// [`PllBlock::item`], which cannot be handed a C index at all.
+    fn c_item(&self, i: usize) -> u32 {
         self.item[i - 9]
     }
 }
 
 /// `0.05f` as the C's comparison sees it: a `float` literal promoted to
 /// `double`, i.e. 0.05000000074505805969238281250, not 0.05
-/// (`video.cpp:238`, `:281`).
+/// (`video.cpp:238`, `:282`).
 const KO_LOW: f64 = 0.05_f32 as f64;
 
 /// `0.95f` promoted to `double`: 0.94999998807907104492187500, not 0.95
-/// (`video.cpp:238`, `:285`).
+/// (`video.cpp:238`, `:286`).
 const KO_HIGH: f64 = 0.95_f32 as f64;
 
 /// `1500.f` (`video.cpp:241`). Exactly representable, so it is just 1500.0.
@@ -176,8 +179,30 @@ const FVCO_MAX: f64 = 1500.0;
 /// (`video.cpp:232-236`); `50.f` is exact, so this is plain 50.0.
 const F_REF_MHZ: f64 = 50.0;
 
-/// `2^32`, the scale `ko` is turned into `K` with (`video.cpp:294`).
+/// `2^32`, the scale `ko` is turned into `K` with (`video.cpp:293`).
 const K_SCALE: f64 = 4294967296.0;
+
+/// The largest C the opening `while ((Fout*c) < 400) c++;` search may reach.
+///
+/// **Not in the C.** Both copies of that loop (`video.cpp:227` and `:275`)
+/// have no exit of their own: for an `Fout` too small for `Fout * c` ever to
+/// reach 400, `c` runs past `UINT32_MAX` and wraps, and the loop never ends.
+/// Upstream is safe because every call site hands it a `vmodes[]` row's
+/// `Fpix`; [`solve_pll`] is `pub`, so the precondition is enforced here rather
+/// than assumed (`docs/ARCHITECTURE.md` §2: bounded, always — a hang is worse
+/// than an error exit).
+///
+/// 510 is the ceiling the rest of the transcription already implies:
+/// `getPLLdiv()` packs a divider into two 8-bit half-counts
+/// (`video.cpp:220-221`), and 511 is the first divider whose upper half-count,
+/// `(div / 2) + 1` = 256, no longer fits in its byte. `400 / 510` is 0.784
+/// MHz, so no pixel clock this refuses is one the C would have encoded
+/// usefully anyway.
+///
+/// The *other* `c++` (`video.cpp:247`) needs no bound: it runs only while
+/// `fvco <= 1500`, and `fvco` grows by about `Fout` each time, so from ~400
+/// MHz it takes at most `1100 / 0.784` ≈ 1404 turns.
+const C_MAX: u32 = 510;
 
 /// `getPLLdiv()` (`video.cpp:218-222`).
 ///
@@ -200,7 +225,10 @@ fn get_pll_div(div: u32) -> u32 {
 /// Searches upward from the smallest C that puts `Fvco = Fout * C` at or above
 /// 400 MHz for a C whose fractional part `ko` is not in the PLL's forbidden
 /// bands. Returns `Some((c, m, ko))`, or `None` for the C's `return 0` when
-/// `Fvco` runs past 1500 MHz without a hit.
+/// `Fvco` runs past 1500 MHz without a hit — and also when `f_out` is so small
+/// that the opening search would not terminate ([`C_MAX`]), which the caller
+/// handles the same way it handles `return 0`, by failing rather than by
+/// spinning.
 ///
 /// Transcribed statement for statement. Two things a reader trips over:
 ///
@@ -212,10 +240,13 @@ fn get_pll_div(div: u32) -> u32 {
 ///   truncating cast to M and once for the subtraction. Same value; written
 ///   the same way so the two lines stay side by side with the C.
 fn find_pll_par(f_out: f64) -> Option<(u32, u32, f64)> {
-    // video.cpp:226-227
+    // video.cpp:226-227. The C_MAX bail is not in the C; see C_MAX.
     let mut c: u32 = 1;
     while (f_out * f64::from(c)) < 400.0 {
         c += 1;
+        if c > C_MAX {
+            return None;
+        }
     }
 
     // video.cpp:229
@@ -247,33 +278,46 @@ fn find_pll_par(f_out: f64) -> Option<(u32, u32, f64)> {
     }
 }
 
-/// `setPLL()` (`video.cpp:262-318`): solve for the PLL block that produces
+/// `setPLL()` (`video.cpp:262-315`): solve for the PLL block that produces
 /// `f_out_mhz` from the 50 MHz reference.
 ///
-/// When [`find_pll_par`] gives up, the fallback (`video.cpp:273-292`) redoes
+/// When [`find_pll_par`] gives up, the fallback (`video.cpp:273-291`) redoes
 /// the first candidate and snaps `ko` to zero at whichever end it fell off,
 /// carrying into M at the top end. That path costs exactness but always
 /// terminates, which is why it exists.
 ///
-/// `f_out_mhz` must be positive and finite. Both `while (Fout*c) < 400` loops
-/// spin forever on zero, in the C as much as here; upstream never guards it
-/// because a `vmodes[]` row always has a clock. Ours come from [`MODE_720P`]
-/// and [`MODE_480P`], so the debug assertion below is documentation rather
-/// than defence.
-pub fn solve_pll(f_out_mhz: f64) -> PllBlock {
-    debug_assert!(
-        f_out_mhz.is_finite() && f_out_mhz > 0.0,
-        "solve_pll needs a positive finite pixel clock"
-    );
+/// Returns `None` for a pixel clock the C's own search cannot handle: zero,
+/// negative, infinite, NaN, or so small that the opening `while (Fout*c) < 400`
+/// would run `c` past `UINT32_MAX` and wrap ([`C_MAX`]). Upstream has no such
+/// guard and simply spins or overflows there, because a `vmodes[]` row always
+/// carries a real clock; this one is `pub`, and
+/// `docs/ARCHITECTURE.md` §2 says a search that cannot finish is an error and
+/// never a hang. Every clock the C solves, this solves identically — the
+/// golden vectors are the proof.
+///
+/// Note that the C's `return 0` from `findPLLpar()` is *not* one of those
+/// failures: it is the ordinary "no exact parameters" case and takes the
+/// fallback below, exactly as upstream.
+pub fn solve_pll(f_out_mhz: f64) -> Option<PllBlock> {
+    // Not in the C. `(fvco / 50) as u32` would saturate for an infinity and
+    // give 0 for a NaN, and the fallback's `m++` would then run off the top of
+    // a u32; upstream never sees either because `Fout` is a table literal.
+    if !f_out_mhz.is_finite() || f_out_mhz <= 0.0 {
+        return None;
+    }
 
     // video.cpp:272
     let (c, m, ko) = match find_pll_par(f_out_mhz) {
         Some(found) => found,
         None => {
-            // video.cpp:274-275
+            // video.cpp:274-275, with the same C_MAX bail as find_pll_par:
+            // this is the second copy of the unbounded loop.
             let mut c: u32 = 1;
             while (f_out_mhz * f64::from(c)) < 400.0 {
                 c += 1;
+                if c > C_MAX {
+                    return None;
+                }
             }
 
             // video.cpp:277-279
@@ -285,7 +329,10 @@ pub fn solve_pll(f_out_mhz: f64) -> PllBlock {
             if ko <= KO_LOW {
                 ko = 0.0;
             } else if ko >= KO_HIGH {
-                m += 1;
+                // video.cpp:288 is a bare `m++`. Checked, not wrapping: for
+                // any clock the guard at the top of this function admits, M is
+                // far below u32::MAX and this never fires.
+                m = m.checked_add(1)?;
                 ko = 0.0;
             }
 
@@ -293,16 +340,16 @@ pub fn solve_pll(f_out_mhz: f64) -> PllBlock {
         }
     };
 
-    // video.cpp:294. K is 1, not 0, when the fraction vanished: the reconfig
+    // video.cpp:293. K is 1, not 0, when the fraction vanished: the reconfig
     // block reads 0 as "no fractional path at all".
     let k: u32 = if ko != 0.0 { (ko * K_SCALE) as u32 } else { 1 };
 
-    // video.cpp:296-298
+    // video.cpp:295-297
     let mut fvco = ko + f64::from(m);
     fvco *= F_REF_MHZ;
     let f_pix = fvco / f64::from(c);
 
-    // video.cpp:301-313. item[9] is index 0 here.
+    // video.cpp:301-312. item[9] is index 0 here.
     let item = [
         4,              // item[9]
         get_pll_div(m), // item[10]
@@ -318,14 +365,14 @@ pub fn solve_pll(f_out_mhz: f64) -> PllBlock {
         k,              // item[20]
     ];
 
-    PllBlock {
+    Some(PllBlock {
         item,
         c,
         m,
         k,
-        // video.cpp:315
+        // video.cpp:314
         f_pix_mhz: f_pix,
-    }
+    })
 }
 
 /// Variable refresh rate, bit 14 of word 1 (`video.cpp:2270`, `use_vrr`).
@@ -446,7 +493,7 @@ mod tests {
         // Cross-checked against tests/golden/pll.json, which is generated by
         // compiling the C. Repeated here so a broken solver fails a unit test
         // too, not only the integration test.
-        let pll = solve_pll(MODE_720P.f_pix_mhz);
+        let pll = solve_pll(MODE_720P.f_pix_mhz).expect("720p has a real clock");
         assert_eq!(pll.c, 6);
         assert_eq!(pll.m, 8);
         assert_eq!(pll.k, 3_908_420_239);
@@ -472,7 +519,7 @@ mod tests {
 
     #[test]
     fn solve_pll_480p() {
-        let pll = solve_pll(MODE_480P.f_pix_mhz);
+        let pll = solve_pll(MODE_480P.f_pix_mhz).expect("480p has a real clock");
         assert_eq!(pll.c, 16);
         assert_eq!(pll.m, 8);
         assert_eq!(pll.k, 240_518_168);
@@ -483,8 +530,33 @@ mod tests {
     }
 
     #[test]
+    fn solve_pll_refuses_what_the_c_would_spin_on() {
+        // Upstream's `while ((Fout*c) < 400) c++;` never ends for these, and
+        // in a release build (overflow-checks off) `c` just wraps. Bounded,
+        // always: docs/ARCHITECTURE.md §2.
+        assert_eq!(solve_pll(0.0), None);
+        assert_eq!(solve_pll(-74.25), None);
+        assert_eq!(solve_pll(f64::NAN), None);
+        assert_eq!(solve_pll(f64::INFINITY), None);
+        assert_eq!(solve_pll(f64::NEG_INFINITY), None);
+        // Positive but far too small for Fout * C_MAX to reach 400 MHz.
+        assert_eq!(solve_pll(1e-9), None);
+    }
+
+    #[test]
+    fn the_c_max_bound_refuses_nothing_a_real_clock_needs() {
+        // 1 MHz is three orders of magnitude below any mode in vmodes[] and
+        // still solves: C = 400 (1.0 * 400 is the first Fvco >= 400), M = 8,
+        // ko = 0 so K is 1, and getPLLdiv(400) = (200 << 8) | 200.
+        let pll = solve_pll(1.0).expect("1 MHz is inside the bound");
+        assert_eq!((pll.c, pll.m, pll.k), (400, 8, 1));
+        assert_eq!(pll.item[5], 0xC8C8);
+        assert_eq!(pll.f_pix_mhz, 1.0);
+    }
+
+    #[test]
     fn c_item_indexes_in_c_coordinates() {
-        let pll = solve_pll(MODE_720P.f_pix_mhz);
+        let pll = solve_pll(MODE_720P.f_pix_mhz).expect("720p has a real clock");
         assert_eq!(pll.c_item(9), 4);
         assert_eq!(pll.c_item(10), 0x0404);
         assert_eq!(pll.c_item(14), 0x0303);
@@ -493,7 +565,7 @@ mod tests {
 
     #[test]
     fn set_video_burst_720p_word_by_word() {
-        let pll = solve_pll(MODE_720P.f_pix_mhz);
+        let pll = solve_pll(MODE_720P.f_pix_mhz).expect("720p has a real clock");
         let w = set_video_words(&MODE_720P, &pll);
 
         // k = 3908420239 = 0xE8F5C28F.
@@ -543,7 +615,7 @@ mod tests {
 
     #[test]
     fn set_video_burst_480p_word_by_word() {
-        let pll = solve_pll(MODE_480P.f_pix_mhz);
+        let pll = solve_pll(MODE_480P.f_pix_mhz).expect("480p has a real clock");
         let w = set_video_words(&MODE_480P, &pll);
 
         // k = 240518168 = 0x0E560418.
@@ -578,7 +650,7 @@ mod tests {
             vpol: 1,
             ..MODE_720P
         };
-        let pll = solve_pll(mode.f_pix_mhz);
+        let pll = solve_pll(mode.f_pix_mhz).expect("720p has a real clock");
         let w = set_video_words(&mode, &pll);
         assert_eq!(w[0], 0x8000 | 1280); // pr in bit 15 of word 1
         assert_eq!(w[2], 0x8000 | 40); // hpol in bit 15 of word 3
