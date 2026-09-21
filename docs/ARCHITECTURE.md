@@ -172,9 +172,29 @@ Default mode: **1280x720@60**, `Fpix = 74.25`, timings
   SMBus receive-byte as the presence probe, and refuse with a distinct exit
   code if more than one bus answers (a fourth adapter in the DT would make
   the wrong bus win silently). `CONFIG_I2C_CHARDEV=y` in our kernel.
+- **A bus that is missing and a bus that refuses us are different
+  failures.** The C's scan makes every setup failure a `continue`
+  (`smbus.cpp:228-239`) because its caller only wants a descriptor; our
+  caller's whole output is the exit code, so the errno decides. A bus that
+  is not there (`ENOENT`/`ENODEV` from the `open`) or that nothing answers on
+  (`ENXIO`, `EREMOTEIO` — adapters differ over which one a NOACK becomes, so
+  both count — or `ETIMEDOUT` from the probe) is skipped exactly as the C
+  skips it, and if no bus answers that is exit 12. A bus that exists and
+  cannot be used — `EACCES` because we are not root, `EBUSY` because a kernel
+  driver has claimed `0x39`, an adapter that cannot do the transaction — is
+  exit 14, which is what §7 promises for "`/dev/i2c-*` … could not be
+  opened"; exit 12 would be a lie the installer is told to pass over
+  silently. The scan still probes all three buses and only reports such an
+  error when *nothing* answered, so an unusable bus can never hide the one
+  the chip is on.
 - **Transport.** `ioctl(I2C_SLAVE, 0x39)` then SMBus *write byte data* per
   register (`i2c_smbus_write_byte_data`, `video.cpp:1610`). One NAK is logged
-  and the table continues, as Main does.
+  and the table continues, as Main does — and that holds at **every** i2c
+  write site, not just the bulk tables: Main log-and-continues in
+  `hdmi_config_set_csc()` (`video.cpp:1399-1403`), for the three mode
+  registers (`:1716-1722`) and for `tmds_power()`'s `0x41` (`:2737-2745`)
+  alike. So every write goes through `hw::write_table`, which owns the
+  policy and counts the refusals; a refused register never fails the run.
 - **Tables.** Transcribe verbatim, in order, as `(reg, value)` byte pairs:
   `init_data[]` in `hdmi_config_init()` (`video.cpp:1499-1607`, the table
   whose first row is `0x98, 0x03` and last row `0xFA, 0x7D`), then the audio
@@ -240,6 +260,16 @@ the reply, and send the payload only when it is non-zero. A core that answers
 of pushing ten words at a core that is not listening. `UIO_SET_VIDEO` has no
 such gate (§2).
 
+**A core that answers `0` is reported, not failed.** The tool says so on
+stderr — Main's own line is "Core doesn't support HPS frame buffer"
+(`video.cpp:3535`) — skips the sysfs write, and exits 0, because §7's table
+has no code for it and inventing one would change what a non-zero exit means
+to the installer. Skipping the sysfs write is the part that matters: a core
+with no HPS frame buffer is not scanning `/dev/fb0` out, so re-registering it
+at a new geometry would leave a rig log looking green and a monitor black. If
+a later phase needs to tell this case apart programmatically, it gets a code
+of its own here and in §7 together.
+
 `fb_width`/`fb_height` are the **framebuffer's** size and are not in general the
 mode's active area: `video_fb_config()` sets `fb_width = item[1] / fb_scale_x`
 and `fb_height = item[5] / fb_scale_y` (`video.cpp:3575-3576`), where `fb_scale`
@@ -269,13 +299,21 @@ parts are unit-tested on the host.
 ```
 src/
   main.rs        argument parsing (hand-rolled; no clap), exit codes, logging
-  mailbox.rs     /dev/mem mapping, spi_w, enable/disable, bounded polling
+  mailbox.rs     spi_w, enable/disable, bounded polling, over a two-register trait
   video.rs       Modeline, vmodes subset, PLL solver, SET_VIDEO word composer
-  adv7513.rs     bus discovery, SMBus writes, the three tables
-  fb.rs          SET_FBUF composer, sysfs mode write
+  adv7513.rs     the three tables, the chip address, the three mode registers
+  fb.rs          SET_FBUF composer, the text of the sysfs mode line
   say.rs         write text to /dev/tty1 (v1); direct 8x16 draw is a later task
-  hw.rs          the only module that touches /dev/mem, /dev/i2c-*, sysfs, tty
+  hw.rs          the only module that touches /dev/mem, /dev/i2c-*, sysfs, tty:
+                 the mmapped Regs, I2C bus discovery and writes, the two writers
 ```
+
+The three lines that moved are `mailbox.rs`'s mapping, `adv7513.rs`'s bus
+discovery and SMBus writes, and `fb.rs`'s sysfs write: the I/O of all three
+lives in `hw.rs`, which is what the last line of the list said all along, and
+the modules above it are left pure. The traits `hw.rs` publishes
+(`mailbox::Regs`, `hw::I2cBus`, `hw::ModeSink`, `hw::TextSink`) are the seam,
+so the CLI is driven end to end by fakes.
 
 Rules:
 
@@ -294,9 +332,21 @@ Rules:
   (`armv7-unknown-linux-gnueabihf`); the crate must also build for
   `armv7-unknown-linux-musleabihf` with `+crt-static`, since that is what
   the installer config on `master` still says today. No `std` features that
-  differ between the two.
+  differ between the two. Two `libc` types *do* differ between them and both
+  are load-bearing in `hw.rs`: `libc::Ioctl` is `c_ulong` on gnueabihf and
+  `c_int` on musleabihf, so ioctl request numbers are written in that type
+  rather than a hardcoded one; and `libc::off_t` is 32-bit on gnueabihf but
+  64-bit on musleabihf, which `0xFF706000` does not fit in, so the `/dev/mem`
+  mapping calls `mmap64` on glibc and `mmap` elsewhere (Main_MiSTer gets the
+  same wide call from `-D_FILE_OFFSET_BITS=64`, `Makefile:52`). Neither can be
+  settled by reasoning: both targets get built.
 - **No panics on the hardware paths.** Every error is a typed enum mapped to
-  an exit code (§7). `unwrap()` is banned outside tests.
+  an exit code (§7). `unwrap()` is banned outside tests, and so are
+  `eprintln!` and `println!`: both **panic** if the write fails (a full
+  overlay, stderr into a consumer that exited, fd 2 closed), and with
+  `panic = "abort"` in the release profile that panic is a SIGABRT whose
+  status is not one of the §7 codes. Diagnostics go through `hw::log`, which
+  drops the write error instead.
 
 ## 7. CLI and exit codes
 
@@ -307,6 +357,7 @@ itsalive fb enable [--mode 720p|480p] | disable
 itsalive say [--clear] <text>...
 itsalive up [--mode ...]        = hdmi + fb enable, the installer's one call
 itsalive leds <mask>            optional, v1.1: UIO_LEDS 0x25, on-board LEDs
+itsalive --help                 the usage text, on stdout, exit 0
 ```
 
 | Exit | Meaning | Installer's reaction |
@@ -321,6 +372,32 @@ itsalive leds <mask>            optional, v1.1: UIO_LEDS 0x25, on-board LEDs
 
 `probe` prints one line per finding and exits with the first failing code, so
 the installer can decide before it tries `up`. `--json` is for the rig log.
+Its three findings are the bitstream, the ADV7513's bus and the presence of
+the sysfs knob; it asks the first with a bare GPI read (`is_fpga_ready(1)`,
+`fpga_io.cpp:655-662`) rather than a mailbox transfer, so it writes nothing at
+all, can be run twice, and cannot itself report exit 11.
+
+The same GPI read guards `hdmi`, `fb` and `up` before their first write. Main
+has no such check — it meets an unconfigured fabric inside `fpga_spi()`
+(`fpga_io.cpp:699`) and reboots the board — but §1 is why we need one: with no
+bitstream the HPS i2c peripheral is not routed to the chip, so without it the
+92 bulk writes would all NAK into the void before the first mailbox word
+produced exit 10 anyway.
+
+**Before the first write, and before the i2c bus is opened.** Bus discovery
+(§4) probes `0x39` on all three adapters, and on an unconfigured fabric none of
+them can answer, so a scan that runs first turns an empty fabric into exit 12 —
+"ADV7513 not found on any bus", a hardware-absent diagnosis for a board whose
+only problem is an unloaded core — and the *same board* then answers 10 to
+`probe` and `fb enable` and 12 to `hdmi` and `up`. The GPI read therefore comes
+before the `open`, in the two subcommands that touch both devices.
+
+`hdmi --off` is guarded too, and it is the one place this costs something: a
+single `0x41 = 0x50` write now needs `/dev/mem` open as well, and can report
+exit 14 where it would otherwise have reported 12. That is the right trade —
+an i2c write on an empty fabric reaches nothing either, and unguarded the NAK
+is logged and swallowed (§4) and `--off` exits 0 having changed nothing — and
+the installer never calls `--off` (§8).
 
 Every hardware subcommand is idempotent: running `hdmi` twice is harmless,
 and `fb enable` after `hdmi` after `up` is harmless.
