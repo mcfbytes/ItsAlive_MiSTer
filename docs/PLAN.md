@@ -129,6 +129,11 @@ core in the fabric:
       and it is also the first evidence anywhere that the mode write of §5
       actually took: `mode_set` returns 0 even when the driver never probed.
       If it is empty, stop — nothing below can work and `image` will say so.
+      `1280 720` is load-bearing in that line: the driver's *own* probe
+      defaults are `8888 1 640 480 2560` (`MiSTer_fb.c:31` for `rb`/`format`,
+      `:150-152` for the geometry, `:227` for the 8888), and they pass every
+      check `image` makes. A knob that says 640x480 is the one reading that
+      proves nothing.
    b. On the build host, make a test image whose four corners are different
       colours and whose left half is **red**, then copy it over:
       `ffmpeg -i test.png -vf scale=1280:720 -f rawvideo -pix_fmt bgra test.raw`.
@@ -139,12 +144,30 @@ core in the fabric:
       `itsalive image --size 320x200 --clear small.raw` → expect it centred
       with black around it. Check the edges: a sheared or diagonally
       displaced picture means the stride, a picture offset by a constant
-      means the centring.
+      means the centring. **Exit 0 is not a pass here** — it says the bytes
+      reached `/dev/fb0`, nothing more — so the photograph is the result and
+      the exit code is only a filter. Copy any stderr line about the stride
+      into the log verbatim: it means the fbdev and the frame reader were
+      given different numbers, which is the one case where a picture that is
+      byte-for-byte right for the driver is sheared on the screen.
    d. `itsalive say hello` afterwards → expect text over the picture, and
       watch for a blinking cursor block (§2 unknown 9). Log what it does to
       the image; that answer decides what the installer is allowed to call.
    Also run `itsalive image` *before* `fb enable` on a fresh boot once, and
-   log that it exits 2 and says to run `fb enable` first.
+   log the knob and the exit code together, because which of two things
+   happens is itself the finding:
+   - the knob is **empty** — `MiSTer_fb` never probed, `mode_get` returns 0
+     bytes under `if(p_fbdev)` — and `image` exits 2 naming `fb enable`; or
+   - the knob is **`8888 1 640 480 2560`**, the driver's probe defaults, and
+     then a 1280x720 source is refused for its *size* while
+     `itsalive image --size 320x200 small.raw` is **accepted and exits 0 with
+     nothing on the screen**, because the frame reader is still on the core's
+     own buffer.
+   The second is the expected one on the installed system, and it is why the
+   installer must not read `image`'s exit code as "a picture is up". If we
+   ever want that guarantee, the only signal that carries it is
+   `UIO_SET_FBUF`'s reply word, which `fb enable` already reads and `image`
+   deliberately does not.
 7. `itsalive hdmi --mode 480p` after `fb disable` → expect a picture again.
 8. Restart Main (or reboot). Confirm Main comes up normally after the tool
    touched the fabric; log it.
@@ -154,7 +177,10 @@ core in the fabric:
 
 The `mode` read-back in step 6a is worth running at every earlier step too: it
 costs nothing, and it is the one line that separates "the knob was written" from
-"the driver took it".
+"the driver took it" — as far as it goes, which is to the edge of the SoC. It
+says the driver probed and what layout it registered, and nothing at all about
+whether the fabric's frame reader is pointed at the HPS buffer. At 1280x720 it
+at least cannot be confused with the probe defaults; at 640x480 it can.
 
 If step 4 shows nothing: try the ADV7513 mode registers (`0x17/0x3B/0x3C`),
 then the 480p mode, then compare against a `strace -e ioctl` of stock Main's

@@ -364,25 +364,59 @@ convert splash.png -resize 1280x720! -depth 8 bgra:splash.raw   # the same file
 zcat splash.raw.gz | itsalive image -                           # on the board
 ```
 
-Three things about it follow from the driver rather than from taste:
+Four things about it follow from the driver rather than from taste:
 
 - **The geometry is read back, not declared.** `image` takes no `--mode`. It
   reads `/sys/module/MiSTer_fb/parameters/mode`, whose `mode_get` prints
   `"%u %u %u %u %u"` = `format rb width height stride`
   (`MiSTer_fb.c:364-371`), and refuses unless `format` is `8888` and `rb` is 1,
-  because any other pair means those four bytes mean something else. This is
-  also the only evidence the mode write above ever took: `mode_set` returns 0
-  unconditionally and its whole body sits inside `if(p_fbdev)`
-  (`MiSTer_fb.c:343-361`), so on a kernel where the driver never probed the
-  sysfs write succeeds and changes nothing. A knob that reads back empty — the
-  same `if(p_fbdev)` makes `mode_get` return 0 bytes — is the operator's cue to
-  run `itsalive fb enable` first, and that is what the message says.
-- **Rows are addressed by the reported stride**, never by `width * 4`. They are
-  equal for both of our modes because `fb::mode_param_line` writes them that
-  way, but the driver pads to a 256-byte boundary whenever it computes the
-  stride itself (`if(!stride) stride = (width*4 + 255) & ~255;`,
-  `MiSTer_fb.c:152`), and a hardcoded `width * 4` against such a geometry
-  advances too little per row and shears the picture.
+  because any other pair means those four bytes mean something else. It is also
+  the only evidence Linux has that the mode write above went anywhere:
+  `mode_set` returns 0 unconditionally and its whole body sits inside
+  `if(p_fbdev)` (`MiSTer_fb.c:343-361`), so on a kernel where the driver never
+  probed the sysfs write succeeds and changes nothing. A knob that reads back
+  empty — the same `if(p_fbdev)` makes `mode_get` return 0 bytes — is the
+  operator's cue to run `itsalive fb enable` first, and that is what the
+  message says.
+  **A knob that reads back is weaker evidence than it looks.** `rb` starts at 1
+  and `format` at 0 (`MiSTer_fb.c:31`), and `setup_fb_info()` supplies the rest
+  at probe — `if(!width) width = 640; if(!height) height = 480; if(!stride)
+  stride = (width*4 + 255) & ~255;` (`MiSTer_fb.c:150-152`, i.e. 2560), with
+  `format` rewritten to 8888 at `:227` — so a board where `fb enable` has never
+  run reads back exactly `8888 1 640 480 2560` and passes every check while the
+  frame reader is still on the core's own buffer. The read says *the driver
+  probed and here is the layout it registered*, and nothing about the fabric;
+  the word that says the core really has an HPS frame buffer switched in is
+  `UIO_SET_FBUF`'s reply, which belongs to `fb enable`. So **`image` exiting 0
+  means the bytes reached `/dev/fb0`, not that they are on a screen** — on the
+  rig only a photograph is a pass (`docs/PLAN.md` §3 step 6).
+- **Rows are addressed by the reported stride**, never by `width * 4` — and
+  that is trusted because `fb enable` writes *both* sides of it, not because
+  the driver's padded stride would be paintable. Two numbers decide where a
+  byte ends up, and only the first can be read from Linux:
+  `info->fix.line_length`, which the knob reports and which `fb_sys_write`
+  clamps against (`MiSTer_fb.c:156`, `:239`); and word 10 of `UIO_SET_FBUF`,
+  `fb_width * 4` (`video.cpp:3511`), which is the stride the fabric's frame
+  reader walks DDR with and therefore the only one that reaches the screen.
+  `fb::mode_param_line` and `fb::enable_words` go out together and both say
+  `width * 4`, so for every geometry this crate programmed the two agree.
+  Where they do not — the driver's auto-pad, `if(!stride) stride =
+  (width*4 + 255) & ~255;` (`MiSTer_fb.c:152`), gives a 720-pixel row 3072
+  against the fabric's 2880 — no blit is right for both: rows placed by the
+  knob match the fbdev byte for byte and shear diagonally on screen.
+  `fb::stride_warning` says so on stderr and the blit goes ahead, because the
+  knob's number is the only one `image` has, and "bug in the caller" (§7's
+  exit 2) is not a verdict it can support.
+- **The source is read with a cap**, because the plan exists before the reader
+  is called. `hw::read_source` takes `BlitPlan::source_len()` and stops one
+  byte past it, which is enough for `check_source_len` to answer "longer than N"
+  and not enough for `zcat rootfs.tar.gz | itsalive image -`, or a mistyped
+  path, to pull a large file into a 1 GB board's RAM: `panic = "abort"` makes
+  an allocation failure a `SIGABRT`, which is not one of §7's exit codes. A
+  *short* source is still read whole, so the ratio between the two counts keeps
+  diagnosing the converter (three quarters is `-pix_fmt bgr24`); a long one is
+  reported as "longer than" rather than as a count the tool cannot stand
+  behind.
 - **Plain `write(2)`: no `mmap`, and no new `unsafe`.** The driver's `fb_ops`
   has `.fb_write = fb_sys_write` (`MiSTer_fb.c:137`), which honours the file
   offset, so a `seek` and a `write` per row is the whole interface. Its mapping

@@ -366,9 +366,29 @@ pub const RB_SWAPPED: u32 = 1;
 /// (`MiSTer_fb.c:364-371`). It prints `"%u %u %u %u %u"` — `format rb width
 /// height stride` — from the same five statics the store parsed into
 /// (`MiSTer_fb.c:31`), and returns 0 bytes under the same `if(p_fbdev)`. So
-/// reading the knob back is the only evidence the geometry took, and an empty
-/// read is precisely the "the driver is not there" case rather than a
+/// reading the knob back is the only evidence available in Linux at all, and
+/// an empty read is precisely the "the driver is not there" case rather than a
 /// malformed one.
+///
+/// # What a non-empty read does *not* prove
+///
+/// It does not prove that `itsalive fb enable` ran, and it says nothing about
+/// the fabric. `rb` defaults to 1 and `format` to 0 (`MiSTer_fb.c:31`), and
+/// `setup_fb_info()` fills the rest in at probe — `if(!width) width = 640;
+/// if(!height) height = 480; if(!stride) stride = (width*4 + 255) & ~255;`
+/// (`MiSTer_fb.c:150-152`), which is 2560 — before the `else` arm rewrites
+/// `format` to 8888 (`MiSTer_fb.c:227`). A board where nothing has ever
+/// written this knob therefore reads back exactly `8888 1 640 480 2560`, which
+/// passes every check in [`BlitPlan::new`] while the fabric's frame reader is
+/// still on the core's own buffer and nothing scans out the bytes we write.
+///
+/// The one signal that says the core really has an HPS frame buffer switched
+/// in is the `UIO_SET_FBUF` reply word, and that belongs to `fb enable`:
+/// `image` opens no `/dev/mem` and asks the fabric nothing
+/// (`docs/ARCHITECTURE.md` §5). So this read means "the driver probed, and
+/// here is the layout it registered" — and `image` exiting 0 means the bytes
+/// reached `/dev/fb0`, not that they are on a screen. On the rig only a
+/// photograph settles that (`docs/PLAN.md` §3 step 6).
 ///
 /// # The byte order this crate writes, and why it is BGRX
 ///
@@ -429,6 +449,51 @@ impl FbMode {
     pub const fn byte_len(&self) -> u64 {
         (self.stride as u64) * (self.height as u64)
     }
+}
+
+/// The stride the fabric's frame reader was told, for a framebuffer `width`
+/// pixels wide: `fb_width * 4` (`video.cpp:3511`, word 10 of `UIO_SET_FBUF`,
+/// transcribed in [`enable_words`]).
+///
+/// This is not readable from Linux — it lives in the frame reader's registers,
+/// reachable only through the mailbox — so it is a rule rather than a
+/// measurement, and [`stride_warning`] is what happens when the knob disagrees
+/// with it.
+pub const fn frame_reader_stride(width: u32) -> u64 {
+    (width as u64) * (BYTES_PER_PIXEL as u64)
+}
+
+/// A line for stderr when the knob's stride is not the one the frame reader
+/// walks DDR with, or `None` when the two agree.
+///
+/// Two strides decide where a pixel ends up and only one of them is readable:
+/// `info->fix.line_length` (`MiSTer_fb.c:156`), which the knob reports and
+/// which `fb_sys_write` clamps against, and word 10 of `UIO_SET_FBUF`
+/// (`video.cpp:3511`), which is what the fabric scans out. [`mode_param_line`]
+/// and [`enable_words`] are written together and both say `width * 4`, so for
+/// any geometry `itsalive fb enable` programmed they are the same number.
+///
+/// They come apart when something else registered the fbdev — the driver's own
+/// auto-pad, `if(!stride) stride = (width*4 + 255) & ~255;`
+/// (`MiSTer_fb.c:152`), gives a 720-pixel row 3072 where the fabric is at 2880
+/// — and then no blit is right for both: rows placed by the knob match the
+/// fbdev byte for byte and shear diagonally across the screen.
+///
+/// This warns rather than refusing. The reported stride is the only number
+/// `image` has, `width * 4` is a guess about a register it cannot read, and
+/// §7's exit 2 means "bug in the caller", which a padded knob is not.
+pub fn stride_warning(mode: &FbMode) -> Option<String> {
+    let programmed = frame_reader_stride(mode.width);
+    if u64::from(mode.stride) == programmed {
+        return None;
+    }
+    Some(format!(
+        "itsalive: the framebuffer reports a stride of {} bytes, but a frame reader \
+         configured for a {}-pixel row scans {programmed} (video.cpp:3511); rows go where the \
+         driver says, so if the two disagree the picture will shear: run `itsalive fb enable` \
+         to write both",
+        mode.stride, mode.width
+    ))
 }
 
 /// The complaint for a knob that is not five numbers.
@@ -498,16 +563,33 @@ pub struct Row {
 /// `/dev/fb0` is opened. The bytes are [`FbMode`]'s BGRX8888 and this type
 /// never inspects them.
 ///
-/// # Addressing is by the reported stride, never by `width * 4`
+/// # Addressing is by the reported stride, and what that is worth
 ///
-/// Row `r` of the source starts at `(y + r) * stride + x * 4`. The two modes
-/// this tool programs have `stride == width * 4` because [`mode_param_line`]
-/// writes it that way, but the driver pads to a 256-byte boundary whenever it
-/// computes the stride itself (`if(!stride) stride = (width*4 + 255) & ~255;`,
-/// `MiSTer_fb.c:152`) — which is what happens if the module is loaded with
-/// `width=`/`height=` and no `stride=`, or after any writer other than this
-/// crate. Against such a geometry a hardcoded `width * 4` advances too little
-/// per row and shears the picture diagonally across the screen.
+/// Row `r` of the source starts at `(y + r) * stride + x * 4`, where `stride`
+/// is `info->fix.line_length` exactly as the knob reported it
+/// (`MiSTer_fb.c:156`).
+///
+/// **It is trusted because `fb enable` writes both sides of it, not because
+/// the driver's padded stride would be paintable.** Two numbers decide where a
+/// byte ends up, and only the first is readable from Linux:
+///
+/// - `info->fix.line_length`, what the knob reports and what `fb_sys_write`
+///   clamps a write against (`smem_len = line_length * yres`,
+///   `MiSTer_fb.c:239`); and
+/// - word 10 of `UIO_SET_FBUF`, `fb_width * 4` (`video.cpp:3511`,
+///   [`enable_words`]), the stride the fabric's frame reader walks DDR with —
+///   the only one that decides what reaches the screen.
+///
+/// [`mode_param_line`] and [`enable_words`] go out together and both say
+/// `width * 4`, so against any geometry this crate programmed the two agree
+/// and addressing by the reported stride *is* addressing by the frame
+/// reader's. Where they differ — the driver's auto-pad, `if(!stride) stride =
+/// (width*4 + 255) & ~255;` (`MiSTer_fb.c:152`), which a module loaded with
+/// `width=`/`height=` and no `stride=` gets, computes 3072 for a 720-pixel row
+/// where the fabric is at 2880 — no blit can be right for both, and rows
+/// placed by the knob match the fbdev byte for byte while shearing diagonally
+/// on screen. [`stride_warning`] names that case on stderr; this type has only
+/// the knob's number and uses it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct BlitPlan {
     /// The source's width in pixels.
@@ -654,16 +736,29 @@ impl BlitPlan {
     /// Both numbers are in the message on purpose. The failing input this is
     /// written for is a mistyped `convert`/`ffmpeg` line on a build host —
     /// `-pix_fmt bgr24` instead of `bgra`, or a `--size` that does not match
-    /// what was actually rendered — and the ratio between the two byte counts
-    /// is what names it: three quarters is a missing padding byte, and an
-    /// exact multiple is a `--size` off by a factor.
+    /// what was actually rendered — and for a **short** source the ratio
+    /// between the two counts is what names it: three quarters of the expected
+    /// length is the missing padding byte.
+    ///
+    /// A **long** source is reported as "longer than", not as a count, because
+    /// [`crate::hw::read_source`] stops one byte past `source_len`: `actual`
+    /// is then a lower bound and printing it as the file's size would be a
+    /// lie. That cap is deliberate — a mistyped path or the wrong file on the
+    /// left of a pipe must not have to fit in a 1 GB board's RAM to be
+    /// diagnosed — and `ls -l` gives the exact number when the ratio is what
+    /// the operator wants.
     pub fn check_source_len(&self, actual: u64) -> Result<()> {
         let expected = self.source_len();
         if actual == expected {
             return Ok(());
         }
+        let counted = if actual > expected {
+            format!("the image is longer than {expected} bytes")
+        } else {
+            format!("the image is {actual} bytes")
+        };
         Err(Error::Usage(format!(
-            "the image is {actual} bytes; a {}x{} BGRX8888 image is exactly {expected} \
+            "{counted}; a {}x{} BGRX8888 image is exactly {expected} \
              ({} x {} x {BYTES_PER_PIXEL}): check --size and that the source is raw \
              4-byte-per-pixel BGRX",
             self.width, self.height, self.width, self.height
@@ -1244,19 +1339,75 @@ mod tests {
 
     /// A geometry with nothing in it, and one whose stride cannot hold a row,
     /// are both refused before any offset is computed.
+    ///
+    /// The messages are asserted, not merely the refusal, because a zero
+    /// dimension is refused twice over: drop the geometry check and a 1x1
+    /// source is still "bigger than" a 0-pixel-wide screen, so the command
+    /// still exits 2 — while telling the operator that the image is wrong when
+    /// what is wrong is that the driver never got a geometry. The `0x0` source
+    /// is the shape the real path reaches, because `--size` omitted means
+    /// "the whole framebuffer" and the whole of a 0x0 framebuffer is 0x0
+    /// (`main.rs`, the `image` arm).
     #[test]
     fn a_degenerate_geometry_is_refused() {
-        assert!(!refusal(&knob(0, 720, 5120), 1, 1).is_empty());
-        assert!(!refusal(&knob(1280, 0, 5120), 1, 1).is_empty());
+        for (mode, w, h) in [
+            (knob(0, 720, 5120), 1, 1),
+            (knob(1280, 0, 5120), 1, 1),
+            // `--size` omitted against a driver that never got a geometry.
+            (knob(0, 0, 0), 0, 0),
+        ] {
+            let msg = refusal(&mode, w, h);
+            assert!(
+                msg.contains(&format!("geometry is {}x{}", mode.width, mode.height)),
+                "the framebuffer is what is wrong, not the source: {msg:?}"
+            );
+            assert!(msg.contains("fb enable"), "{msg:?}");
+        }
         // A stride shorter than the visible row: rows would overlap, and the
         // kernel would clamp the tail against `smem_len` (MiSTer_fb.c:239).
         let msg = refusal(&knob(100, 10, 399), 4, 4);
         assert!(msg.contains("stride"), "{msg:?}");
         // Exactly `width * 4` is the normal case and is fine.
         assert!(BlitPlan::new(&knob(100, 10, 400), 4, 4).is_ok());
-        // A zero-sized source has no rows to place.
-        assert!(!refusal(&knob(100, 10, 400), 0, 4).is_empty());
-        assert!(!refusal(&knob(100, 10, 400), 4, 0).is_empty());
+        // A zero-sized source against a real geometry is the other message:
+        // here the source is what is wrong, and `--size` is what to fix.
+        for (w, h) in [(0, 4), (4, 0)] {
+            let msg = refusal(&knob(100, 10, 400), w, h);
+            assert!(msg.contains(&format!("the image is {w}x{h}")), "{msg:?}");
+            assert!(msg.contains("at least 1"), "{msg:?}");
+        }
+    }
+
+    /// The knob reports one stride; the frame reader walks another, and
+    /// nothing in Linux can read it back.
+    ///
+    /// [`mode_param_line`] (`video.cpp:3468`) and word 10 of [`enable_words`]
+    /// (`video.cpp:3511`) are both `width * 4`, so every geometry this crate
+    /// writes is silent here. The noisy case is a geometry it did not write.
+    #[test]
+    fn a_stride_the_frame_reader_was_never_told_is_warned_about() {
+        assert_eq!(frame_reader_stride(1280), 5120);
+        assert_eq!(stride_warning(&knob(1280, 720, 5120)), None);
+        assert_eq!(stride_warning(&knob(640, 480, 2560)), None);
+
+        // The driver's auto-pad (`MiSTer_fb.c:152`) for a 720-pixel row is
+        // 3072, where any fabric this crate configured is at 2880: 192 bytes
+        // of shear a row, matching the fbdev exactly and the screen not at
+        // all.
+        assert_eq!((720 * 4 + 255) & !255, 3072);
+        let msg = stride_warning(&knob(720, 480, 3072)).expect("3072 is not 720 * 4");
+        assert!(msg.contains("3072"), "{msg:?}");
+        assert!(msg.contains("2880"), "{msg:?}");
+        assert!(msg.contains("fb enable"), "{msg:?}");
+
+        // A stride shorter than the row is warned about as well, on its way
+        // to being refused outright by `BlitPlan::new`.
+        assert!(stride_warning(&knob(100, 10, 399)).is_some());
+
+        // 640 is the case where the pad changes nothing — which is why the
+        // driver's own defaults look exactly like a geometry someone asked
+        // for (see `FbMode`).
+        assert_eq!((640 * 4 + 255) & !255, 2560);
     }
 
     /// The source has to be exactly `w * h * 4` bytes, and the message names
@@ -1268,21 +1419,41 @@ mod tests {
         assert_eq!(plan.source_len(), 1760);
         assert!(plan.check_source_len(1760).is_ok());
 
-        for actual in [0u64, 1759, 1761, 1320, 3520] {
+        // Short: the exact count is in the message, because the reader has
+        // the whole file and the ratio is the diagnosis. 1320 is the
+        // `-pix_fmt bgr24` mistake — three bytes a pixel, three quarters of
+        // 1760 — and nothing guesses: the operator reads the two counts.
+        assert_eq!(40 * 11 * 3, 1320);
+        for actual in [0u64, 1, 1320, 1759] {
             let err = plan
                 .check_source_len(actual)
                 .expect_err("only the exact length is accepted");
             assert_eq!(err.exit_code(), 2);
             let msg = err.to_string();
-            assert!(msg.contains(&actual.to_string()), "{msg:?}");
+            assert!(
+                msg.contains(&format!("the image is {actual} bytes")),
+                "{msg:?}"
+            );
             assert!(msg.contains("1760"), "{msg:?}");
         }
 
-        // 1320 is the `-pix_fmt bgr24` mistake (three bytes a pixel) and 3520
-        // is a `--size` off by a factor of two; both are ordinary numbers
-        // here, which is the point — nothing guesses, the operator reads the
-        // two counts and sees the ratio.
-        assert_eq!(40 * 11 * 3, 1320);
+        // Long: "longer than", never a count. `hw::read_source` stops one
+        // byte past `source_len`, so anything above the expectation is a
+        // lower bound — 1761 here is "at least 1761", and printing it as the
+        // file's size would be a lie. That cap is what keeps a mistyped path
+        // to something huge an exit 2 instead of an allocation failure.
+        for actual in [1761u64, 3520, u64::MAX] {
+            let err = plan
+                .check_source_len(actual)
+                .expect_err("only the exact length is accepted");
+            assert_eq!(err.exit_code(), 2);
+            let msg = err.to_string();
+            assert!(msg.contains("longer than 1760 bytes"), "{msg:?}");
+            assert!(
+                !msg.contains("3520"),
+                "no count it cannot stand behind: {msg:?}"
+            );
+        }
     }
 
     /// [`BlitPlan::rows`] walks the source once, top to bottom, with no gap

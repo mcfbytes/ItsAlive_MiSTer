@@ -575,7 +575,8 @@ impl PixelSink for FbDevice {
     }
 }
 
-/// Read the whole of an image source: a file, or standard input for `-`.
+/// Read an image source — a file, or standard input for `-` — stopping one
+/// byte past `limit`.
 ///
 /// `-` is what makes `zcat splash.raw.gz | itsalive image -` work in the
 /// installer, where the payload is compressed and there is no room on the
@@ -585,16 +586,40 @@ impl PixelSink for FbDevice {
 /// length check in [`crate::fb::BlitPlan::check_source_len`] is the only thing
 /// that catches a converter invoked with the wrong pixel format, and it cannot
 /// run on a stream that is already half painted on the screen.
-pub fn read_source(path: &str) -> Result<Vec<u8>> {
+///
+/// # Why there is a limit at all
+///
+/// `limit` is [`crate::fb::BlitPlan::source_len`] — the exact byte count the
+/// plan already knows it needs — and this reads `limit + 1` bytes at most, via
+/// [`Read::take`], whose own `read_to_end` caps the `Vec`'s growth at the
+/// remaining limit rather than at whatever arrives.
+///
+/// Without the cap an unbounded `read_to_end` is at the mercy of its argument:
+/// `zcat rootfs.tar.gz | itsalive image -` (the pipe shape of
+/// `docs/ARCHITECTURE.md` §8, with the wrong file on the left) or a mistyped
+/// path to something large would pull the whole of it into a 1 GB board's RAM
+/// — and on an installer's tmpfs initramfs that is reclaim, an OOM kill, or
+/// Rust's allocation-failure handler, which under `panic = "abort"` is a
+/// `SIGABRT` rather than one of §7's exit codes. The one byte past the
+/// expectation is what lets [`crate::fb::BlitPlan::check_source_len`] still
+/// see that the source is too long and exit 2 saying so.
+pub fn read_source(path: &str, limit: u64) -> Result<Vec<u8>> {
+    // Saturating because `limit + 1` is only ever "one more than we want";
+    // a limit of `u64::MAX` is not a length any plan produces, and staying at
+    // `u64::MAX` there is the same unbounded read as before rather than a
+    // wrap to zero.
+    let cap = limit.saturating_add(1);
     let mut bytes = Vec::new();
     if path == "-" {
         io::stdin()
             .lock()
+            .take(cap)
             .read_to_end(&mut bytes)
             .map_err(|e| Error::io("read stdin", e))?;
     } else {
         File::open(path)
             .map_err(|e| Error::io(format!("open {path}"), e))?
+            .take(cap)
             .read_to_end(&mut bytes)
             .map_err(|e| Error::io(format!("read {path}"), e))?;
     }
@@ -1913,13 +1938,46 @@ mod tests {
         let path = scratch("image-src");
         let pixels: Vec<u8> = (0..=255u8).cycle().take(4096).collect();
         fs::write(&path, &pixels).unwrap();
-        let got = read_source(path.to_str().unwrap()).unwrap();
+        let got = read_source(path.to_str().unwrap(), 4096).unwrap();
         assert_eq!(got, pixels);
         fs::remove_file(&path).unwrap();
 
         let missing = scratch("image-src-missing");
-        let err = read_source(missing.to_str().unwrap()).unwrap_err();
+        let err = read_source(missing.to_str().unwrap(), 4096).unwrap_err();
         assert_eq!(err.exit_code(), 14);
+    }
+
+    /// A source longer than the plan expects stops one byte past it.
+    ///
+    /// That one byte is the whole contract with
+    /// [`crate::fb::BlitPlan::check_source_len`]: it is enough to know the
+    /// source is too long — `zcat rootfs.tar.gz | itsalive image -` — and it
+    /// is the difference between exit 2 and a 1 GB board trying to hold the
+    /// whole of whatever was piped in.
+    #[test]
+    fn a_source_longer_than_the_limit_stops_one_byte_past_it() {
+        let path = scratch("image-src-long");
+        let pixels: Vec<u8> = (0..=255u8).cycle().take(4096).collect();
+        fs::write(&path, &pixels).unwrap();
+
+        // The plan wanted 16 bytes; 17 come back, and the extra one is what
+        // says "longer than 16" rather than "exactly 16".
+        let got = read_source(path.to_str().unwrap(), 16).unwrap();
+        assert_eq!(got.len(), 17);
+        assert_eq!(got[..], pixels[..17]);
+
+        // A source shorter than the limit is still read whole, so the ratio
+        // between the two counts stays diagnostic for the `-pix_fmt bgr24`
+        // case (three quarters of the expected length).
+        let got = read_source(path.to_str().unwrap(), 1 << 20).unwrap();
+        assert_eq!(got, pixels);
+
+        // Exactly the limit reads exactly the file and asks for one more byte
+        // that is not there, which is the success case rather than an error.
+        let got = read_source(path.to_str().unwrap(), 4096).unwrap();
+        assert_eq!(got.len(), 4096);
+
+        fs::remove_file(&path).unwrap();
     }
 
     /// The two new traits are object-safe, like the other four, so the CLI can

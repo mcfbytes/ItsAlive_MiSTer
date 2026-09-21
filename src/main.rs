@@ -642,13 +642,25 @@ where
 ///    `rb = 1` ([`fb::BlitPlan::new`]). Writing the mode line proves nothing —
 ///    `mode_set()` returns 0 unconditionally, and its whole body sits inside
 ///    `if(p_fbdev)` (`MiSTer_fb.c:343-361`), so on a kernel where `MiSTer_fb`
-///    never probed `fb enable` reports success and changes nothing. Reading it
-///    back is the only evidence the geometry took, and it is also where the
-///    screen's size comes from: this command takes no `--mode`, because the
-///    driver already knows and a flag could only disagree with it.
+///    never probed `fb enable` reports success and changes nothing. The read
+///    is the only evidence Linux has, and it is also where the screen's size
+///    comes from: this command takes no `--mode`, because the driver already
+///    knows and a flag could only disagree with it.
 /// 2. **Plan**, which decides the centring and every refusal, purely.
-/// 3. **Read the source**, and check its length is exactly `w * h * 4`.
+/// 3. **Read the source**, capped at one byte past what the plan expects, and
+///    check its length is exactly `w * h * 4`.
 /// 4. **Open `/dev/fb0` and paint**, clearing first if asked.
+///
+/// **What exit 0 means here, and what it does not.** It means those bytes
+/// reached `/dev/fb0` in the layout the driver registered. It does not mean
+/// anything is on a screen: `setup_fb_info()` supplies its own defaults at
+/// probe (`MiSTer_fb.c:150-152`, with `format` rewritten to 8888 at `:227` and
+/// `rb` already 1 at `:31`), so a board where `fb enable` has never run reads
+/// back `8888 1 640 480 2560` and passes every check while the fabric's frame
+/// reader is still on the core's own buffer. The word that settles it is
+/// `UIO_SET_FBUF`'s reply, which `fb enable` has and this command deliberately
+/// does not — `image` opens no `/dev/mem` at all. On the rig, only a
+/// photograph is a pass (`docs/PLAN.md` §3 step 6).
 ///
 /// Nothing is opened for writing until every refusal has been decided, so a
 /// bad `--size`, a short file or a framebuffer in the wrong format leaves the
@@ -660,10 +672,16 @@ where
 /// The source is fully read before the first pixel goes out, which is what
 /// makes the length check worth having: it is the only thing that catches a
 /// converter run with the wrong `-pix_fmt`, and it cannot run against a stream
-/// that is already half-way down the screen.
+/// that is already half-way down the screen. "Fully" is bounded: the plan
+/// exists before the reader is called, so it can hand over the exact byte
+/// count and the reader stops one byte past it
+/// ([`hw::read_source`]) — enough for [`fb::BlitPlan::check_source_len`] to
+/// say "longer than", and not enough for `zcat rootfs.tar.gz | itsalive
+/// image -` to turn into an allocation failure, which under `panic = "abort"`
+/// is a `SIGABRT` and not a §7 exit code.
 fn image<S, P>(
     knob: &mut S,
-    source: impl FnOnce() -> Result<Vec<u8>>,
+    source: impl FnOnce(u64) -> Result<Vec<u8>>,
     pixels: impl FnOnce() -> Result<P>,
     size: Option<(u32, u32)>,
     clear: bool,
@@ -673,10 +691,19 @@ where
     P: PixelSink,
 {
     let mode = fb::parse_mode_line(&knob.read_mode_line()?)?;
+    // The *visible* width and height, never `stride / 4`: the stride is bytes
+    // a row including whatever padding the driver added (`MiSTer_fb.c:152`),
+    // and painting that many pixels wide would be wider than the screen.
     let (width, height) = size.unwrap_or((mode.width, mode.height));
     let plan = fb::BlitPlan::new(&mode, width, height)?;
 
-    let data = source()?;
+    // Said once, before any of it is painted: the knob and the frame reader
+    // can disagree about the stride and only the knob is readable.
+    if let Some(warning) = fb::stride_warning(&mode) {
+        hw::log(format_args!("{warning}"));
+    }
+
+    let data = source(plan.source_len())?;
     plan.check_source_len(data.len() as u64)?;
 
     let mut sink = pixels()?;
@@ -994,7 +1021,7 @@ fn dispatch<R, D, B, M, T, P>(
     mode_sink: impl FnOnce() -> M,
     tty: impl FnOnce() -> Result<T>,
     pixels: impl FnOnce() -> Result<P>,
-    source: impl FnOnce(&str) -> Result<Vec<u8>>,
+    source: impl FnOnce(&str, u64) -> Result<Vec<u8>>,
     findings: impl FnOnce() -> (Vec<Finding>, Option<Error>),
 ) -> Result<()>
 where
@@ -1055,7 +1082,9 @@ where
         // refusal can leave a half-painted screen.
         Command::Image { size, clear, path } => {
             let mut knob = mode_sink();
-            image(&mut knob, || source(&path), pixels, size, clear)
+            // The reader's cap comes from the plan, which is built inside
+            // [`image`] — hence a closure over the path rather than a call.
+            image(&mut knob, |limit| source(&path, limit), pixels, size, clear)
         }
 
         // One process, one mailbox, one i2c handle (§7's idempotence rule
@@ -1112,6 +1141,12 @@ mod tests {
         /// `"mode"`, `"tty"`, `"fb"` or `"source"`. Only the dispatch tests
         /// see these; the sequence tests call the sequences directly.
         Open(&'static str),
+        /// The byte count `image` handed the source reader — `w * h * 4`,
+        /// the exact length the plan expects — which is what bounds
+        /// [`hw::read_source`]'s allocation. Recorded because a wrong limit
+        /// is invisible in the pixels: too large and a mistyped path still
+        /// aborts the process, and nothing else here would notice.
+        SourceLimit(u64),
     }
 
     type Log = Rc<RefCell<Vec<Event>>>;
@@ -1892,7 +1927,7 @@ mod tests {
         bus: Result<FakeBus>,
         findings: (Vec<Finding>, Option<Error>),
         mode: FakeMode,
-        source: Vec<u8>,
+        mut source: Vec<u8>,
     ) -> Result<()> {
         dispatch(
             cmd,
@@ -1920,8 +1955,14 @@ mod tests {
                     log: Rc::clone(log),
                 })
             },
-            |_path| {
+            |_path, limit| {
                 log.borrow_mut().push(Event::Open("source"));
+                log.borrow_mut().push(Event::SourceLimit(limit));
+                // The fake honours the cap the way `hw::read_source`'s
+                // `take(limit + 1)` does, so what the tests below assert is
+                // the reader's real behaviour and not a friendlier one.
+                let cap = usize::try_from(limit.saturating_add(1)).unwrap_or(usize::MAX);
+                source.truncate(cap);
                 Ok(source)
             },
             || findings,
@@ -2637,6 +2678,8 @@ mod tests {
                 // Then the source, then the device: `/dev/fb0` is opened last
                 // so that no refusal leaves a half-painted screen.
                 Event::Open("source"),
+                // 2 * 2 * 4: the reader is told exactly what the plan needs.
+                Event::SourceLimit(16),
                 Event::Open("fb"),
                 // Row 0 of the source at (3, 1): 1 * 256 + 3 * 4.
                 Event::Pixels(268, vec![0xFF, 0x00, 0x00, 0x00, 0x00, 0xFF, 0x00, 0x00]),
@@ -2662,6 +2705,7 @@ mod tests {
                 Event::Open("mode"),
                 Event::ModeRead(PADDED_9X5.to_string()),
                 Event::Open("source"),
+                Event::SourceLimit(16),
                 Event::Open("fb"),
                 // stride * height, in one page-sized write from the top.
                 Event::Pixels(0, vec![0u8; 1280]),
@@ -2686,9 +2730,76 @@ mod tests {
                 Event::Open("mode"),
                 Event::ModeRead("8888 1 4 2 16\n".to_string()),
                 Event::Open("source"),
+                // The whole screen: 4 * 2 * 4.
+                Event::SourceLimit(32),
                 Event::Open("fb"),
                 Event::Pixels(0, (0..16u8).collect()),
                 Event::Pixels(16, (16..32u8).collect()),
+            ]
+        );
+    }
+
+    /// With no `--size` against a **padded** knob, the source is the visible
+    /// width — not `stride / 4`.
+    ///
+    /// The only other no-`--size` test has `stride == width * 4`, where the
+    /// two are the same number and deriving the default from the stride would
+    /// be invisible. Here they differ: a 3x2 screen with the driver's 256-byte
+    /// stride takes 12 bytes a row from the source and steps 256 between rows,
+    /// where `stride / 4` would ask for a 64-pixel-wide source and refuse a
+    /// correct `itsalive image splash.raw` with "does not scale and does not
+    /// crop".
+    #[test]
+    fn image_without_a_size_takes_the_visible_width_not_the_stride() {
+        let log = log_new();
+        let source: Vec<u8> = (0..24u8).collect();
+        run_image(&log, "8888 1 3 2 256\n", source, None, false).unwrap();
+
+        assert_eq!(
+            events(&log),
+            vec![
+                Event::Open("mode"),
+                Event::ModeRead("8888 1 3 2 256\n".to_string()),
+                Event::Open("source"),
+                // 3 * 2 * 4 — the visible width, not 256 / 4 * 2 * 4.
+                Event::SourceLimit(24),
+                Event::Open("fb"),
+                // 3 pixels = 12 bytes a row, from (0, 0) because the source
+                // is the whole screen.
+                Event::Pixels(0, (0..12u8).collect()),
+                // One stride later, not one row of pixels later.
+                Event::Pixels(256, (12..24u8).collect()),
+            ]
+        );
+    }
+
+    /// A source longer than the plan expects is exit 2, and the reader never
+    /// sees more than one byte past the expectation.
+    ///
+    /// This is `zcat rootfs.tar.gz | itsalive image -`, or a mistyped path to
+    /// something large. The plan is built before the reader is called, so the
+    /// limit is known; without it the whole of the wrong file would have to
+    /// fit in a 1 GB board's RAM to be diagnosed, and the allocation failure
+    /// that follows is a `SIGABRT` under `panic = "abort"`, not a §7 code.
+    #[test]
+    fn an_oversize_source_is_refused_without_being_read_whole() {
+        let log = log_new();
+        // A 2x2 plan wants 16 bytes; offer 64 KiB of them.
+        let err = run_image(&log, PADDED_9X5, vec![0xABu8; 65536], Some((2, 2)), false)
+            .expect_err("64 KiB is not a 2x2 BGRX image");
+        assert_eq!(err.exit_code(), 2);
+        let msg = err.to_string();
+        assert!(msg.contains("longer than 16 bytes"), "{msg:?}");
+
+        // The reader was told 16, so it stopped at 17 of the 65536 bytes on
+        // offer, and `/dev/fb0` was never opened.
+        assert_eq!(
+            events(&log),
+            vec![
+                Event::Open("mode"),
+                Event::ModeRead(PADDED_9X5.to_string()),
+                Event::Open("source"),
+                Event::SourceLimit(16),
             ]
         );
     }
@@ -2779,6 +2890,7 @@ mod tests {
                 Event::Open("mode"),
                 Event::ModeRead(PADDED_9X5.to_string()),
                 Event::Open("source"),
+                Event::SourceLimit(16),
             ],
             "the source was read, the device was not opened"
         );
