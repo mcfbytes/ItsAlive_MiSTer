@@ -21,6 +21,7 @@ itsalive probe               # is there a core? which i2c bus is the ADV7513 on?
 itsalive hdmi                # program the PLL, timings and the ADV7513: picture appears
 itsalive fb enable           # hand /dev/fb0 to the fabric's frame reader
 itsalive say "Installing"    # put words on that screen
+itsalive image splash.raw    # or a picture: raw BGRX8888, centred, no scaling
 ```
 
 ## Status

@@ -57,7 +57,9 @@ After 1 to 3 the screen shows **the core's own output** (the menu core draws a
 fabric-generated pattern with no HPS help). After 4 the screen shows
 `/dev/fb0`, and because our kernel has `CONFIG_FRAMEBUFFER_CONSOLE=y`, text
 written to `/dev/tty1` is painted by fbcon. That is the same mechanism stock
-MiSTer uses to show `update_all` on screen.
+MiSTer uses to show `update_all` on screen. `itsalive image` writes that same
+surface directly rather than through the console, which is the one thing in
+this tool that needs to know the pixels' byte order (§5).
 
 Main_MiSTer does more after step 2 that we intentionally skip: HDR metadata,
 the SPD InfoFrame, CEC, EDID parsing and interrupt arming. None of it is
@@ -337,9 +339,77 @@ So the order is burst, then knob, then pixels, and `say` must never run before
 every host-side signal healthy — the same symptom as a missing §1 step 3, and
 easy to confuse with it.
 
-Pixel format on the Linux side is XRGB8888 with the RxB bit set, i.e. what the
-kernel driver calls `8888` with `rb = 1`. The tool never writes pixels itself
-in v1; fbcon does.
+### The pixels themselves, and `image`
+
+Pixel format on the Linux side is what the kernel driver calls `8888` with
+`rb = 1`. Spell it out, because it is the single easiest thing here to get
+backwards: `setup_fb_info()`'s 32-bit arm starts at red = 0, green = 8,
+blue = 16 (`MiSTer_fb.c:220-222`) and then exchanges red and blue whenever the
+flag is set (`if(rb) { swap(red.offset, blue.offset); }`,
+`MiSTer_fb.c:230-234`). We always write `rb = 1` (`fb::mode_param_line`, which
+is the `FB_FMT_RxB` bit of the fabric's format word said in the other
+language), so the live layout is **red = 16, green = 8, blue = 0** in a
+little-endian 32-bit word — i.e. the bytes are **B, G, R, X**, blue first and
+the fourth byte unused. Get it backwards and nothing errors anywhere: the
+picture simply comes up with red and blue exchanged, which on a photograph
+reads as a bad source file rather than as a format bug.
+
+`itsalive image` is the only thing in this crate that writes pixels; `say`
+still leaves that to fbcon. It takes a raw file of those four-byte pixels, or
+`-` for stdin, and blits it centred:
+
+```sh
+ffmpeg -i splash.png -vf scale=1280:720 -f rawvideo -pix_fmt bgra splash.raw
+convert splash.png -resize 1280x720! -depth 8 bgra:splash.raw   # the same file
+zcat splash.raw.gz | itsalive image -                           # on the board
+```
+
+Three things about it follow from the driver rather than from taste:
+
+- **The geometry is read back, not declared.** `image` takes no `--mode`. It
+  reads `/sys/module/MiSTer_fb/parameters/mode`, whose `mode_get` prints
+  `"%u %u %u %u %u"` = `format rb width height stride`
+  (`MiSTer_fb.c:364-371`), and refuses unless `format` is `8888` and `rb` is 1,
+  because any other pair means those four bytes mean something else. This is
+  also the only evidence the mode write above ever took: `mode_set` returns 0
+  unconditionally and its whole body sits inside `if(p_fbdev)`
+  (`MiSTer_fb.c:343-361`), so on a kernel where the driver never probed the
+  sysfs write succeeds and changes nothing. A knob that reads back empty — the
+  same `if(p_fbdev)` makes `mode_get` return 0 bytes — is the operator's cue to
+  run `itsalive fb enable` first, and that is what the message says.
+- **Rows are addressed by the reported stride**, never by `width * 4`. They are
+  equal for both of our modes because `fb::mode_param_line` writes them that
+  way, but the driver pads to a 256-byte boundary whenever it computes the
+  stride itself (`if(!stride) stride = (width*4 + 255) & ~255;`,
+  `MiSTer_fb.c:152`), and a hardcoded `width * 4` against such a geometry
+  advances too little per row and shears the picture.
+- **Plain `write(2)`: no `mmap`, and no new `unsafe`.** The driver's `fb_ops`
+  has `.fb_write = fb_sys_write` (`MiSTer_fb.c:137`), which honours the file
+  offset, so a `seek` and a `write` per row is the whole interface. Its mapping
+  is `memremap(..., MEMREMAP_WT)` (`MiSTer_fb.c:261`), write-through, so
+  nothing needs flushing or a barrier afterwards.
+
+A source smaller than the screen is centred by integer division of the slack,
+so an odd remainder goes right and down; one larger than the screen is refused.
+**No scaling and no cropping in v1** — the build host has already done that
+work, and a resampler here would be more code than the rest of the command.
+`--clear` zeroes `stride * height` bytes first, and only matters for a *second*
+image: the sysfs write above already blanks the whole reservation on its way
+past (`memset(p_fbdev->fb_base, 0, resource_size(p_fbdev->fb_res))`,
+`MiSTer_fb.c:350`).
+
+**`say` and `image` target the same pixels and the last writer wins.** `say`
+writes to `/dev/tty1` and fbcon paints it into the same `/dev/fb0` that `image`
+writes directly, so a `say` after an `image` drops text on top of the picture
+at whatever row the console cursor had reached, and a `say --clear` erases the
+picture outright. fbcon also blinks a cursor, which repaints one character cell
+on a timer whether or not anything was written. Mixing the two therefore needs
+a decision rather than an ordering: either burn the text into the image on the
+build host, or turn the cursor off first
+(`echo 0 > /sys/class/graphics/fbcon/cursor_blink`, `fbcon.c:3261-3321`) and
+accept that the next `say` overwrites part of the picture. `PLAN.md` §2 carries
+this as a rig question, because how much of it bites depends on whether fbcon
+is bound at all.
 
 ## 6. The crate
 
@@ -352,18 +422,21 @@ src/
   mailbox.rs     spi_w, enable/disable, bounded polling, over a two-register trait
   video.rs       Modeline, vmodes subset, PLL solver, SET_VIDEO word composer
   adv7513.rs     the three tables, the chip address, the three mode registers
-  fb.rs          SET_FBUF composer, the text of the sysfs mode line
+  fb.rs          SET_FBUF composer, the sysfs mode line and its parser, and
+                 the blit plan `image` paints from
   say.rs         write text to /dev/tty1 (v1); direct 8x16 draw is a later task
-  hw.rs          the only module that touches /dev/mem, /dev/i2c-*, sysfs, tty:
-                 the mmapped Regs, I2C bus discovery and writes, the two writers
+  hw.rs          the only module that touches /dev/mem, /dev/i2c-*, sysfs,
+                 tty and /dev/fb0: the mmapped Regs, I2C bus discovery and
+                 writes, the sysfs knob both ways, and the two byte writers
 ```
 
 The three lines that moved are `mailbox.rs`'s mapping, `adv7513.rs`'s bus
 discovery and SMBus writes, and `fb.rs`'s sysfs write: the I/O of all three
 lives in `hw.rs`, which is what the last line of the list said all along, and
 the modules above it are left pure. The traits `hw.rs` publishes
-(`mailbox::Regs`, `hw::I2cBus`, `hw::ModeSink`, `hw::TextSink`) are the seam,
-so the CLI is driven end to end by fakes.
+(`mailbox::Regs`, `hw::I2cBus`, `hw::ModeSink`, `hw::ModeSource`,
+`hw::TextSink`, `hw::PixelSink`) are the seam, so the CLI is driven end to end
+by fakes.
 
 Rules:
 
@@ -405,6 +478,8 @@ itsalive probe [--json]
 itsalive hdmi [--mode 720p|480p] [--off]
 itsalive fb enable [--mode 720p|480p] | disable
 itsalive say [--clear] <text>...
+itsalive image [--size WxH] [--clear] <path>    raw BGRX8888 onto /dev/fb0,
+                                                `-` reads it from stdin
 itsalive up [--mode ...]        = hdmi + fb enable, the installer's one call
 itsalive leds <mask>            optional, v1.1: UIO_LEDS 0x25, on-board LEDs
 itsalive --help                 the usage text, on stdout, exit 0
@@ -418,7 +493,21 @@ itsalive --help                 the usage text, on stdout, exit 0
 | 11 | mailbox timeout (ack never came) | continue silently |
 | 12 | ADV7513 not found on any bus | continue silently |
 | 13 | ADV7513 on more than one bus | continue, log |
-| 14 | `/dev/mem`, `/dev/i2c-*`, sysfs or tty could not be opened | continue silently |
+| 14 | `/dev/mem`, `/dev/i2c-*`, sysfs, tty or `/dev/fb0` could not be opened or used | continue silently |
+
+**`image` adds no exit code.** It reuses the table above, and the split is that
+a *state* the caller could have avoided is 2 and a *device* that would not
+answer is 14. So a malformed `--size`, a source whose length is not exactly
+`width * height * 4`, a source larger than the screen, and a framebuffer that is
+not `8888` with `rb = 1` are all exit 2; an unreadable source file, an
+unwritable `/dev/fb0`, and a mode knob that cannot be read at all are exit 14.
+The one case worth naming is the knob that reads back *empty* or malformed,
+which `mode_get` produces whenever the driver never probed
+(`MiSTer_fb.c:364-371`): that is exit 2, because it means `itsalive fb enable`
+has not run in this boot and the caller ordered its commands wrong, which is
+precisely what §7 calls a bug in the caller. Inventing a code for it would
+change what a non-zero exit means to the installer for no gain — both 2 and 14
+are "continue".
 
 `probe` prints one line per finding and exits with the first failing code, so
 the installer can decide before it tries `up`. `--json` is for the rig log.
@@ -427,7 +516,10 @@ the sysfs knob; it asks the first with a bare GPI read (`is_fpga_ready(1)`,
 `fpga_io.cpp:655-662`) rather than a mailbox transfer, so it writes nothing at
 all, can be run twice, and cannot itself report exit 11.
 
-The same GPI read guards `hdmi`, `fb` and `up` before their first write. Main
+The same GPI read guards `hdmi`, `fb` and `up` before their first write.
+`say` and `image` are the two that do not take it, and for the same reason:
+both write to a kernel device that exists whether or not the fabric is
+configured, so the read could only turn a harmless no-op into an exit code. Main
 has no such check — it meets an unconfigured fabric inside `fpga_spi()`
 (`fpga_io.cpp:699`) and reboots the board — but §1 is why we need one: with no
 bitstream the HPS i2c peripheral is not routed to the chip, so without it the
@@ -456,8 +548,11 @@ and `fb enable` after `hdmi` after `up` is harmless.
 
 - **Installer initramfs** (Buildroot_MiSTer `board/mister/de10nano/installer-overlay/init`):
   `itsalive up` once after the payload is in RAM, then `itsalive say` per
-  step. Every call is `|| true` with a `timeout`, and the splash section's
-  existing rule holds: **nothing here may fail an install**.
+  step — or, once there is artwork to ship, one
+  `zcat /splash.raw.gz | itsalive image -` in place of the first `say`. Every
+  call is `|| true` with a `timeout`, and the splash section's existing rule
+  holds: **nothing here may fail an install**. If both are used, §5's last
+  paragraph applies: the console and the blit fight over the same pixels.
 - **Installed system, daemon stopped:** a rescue shell over serial or SSH
   runs `itsalive up` and has a screen. This is also the development loop
   (see PLAN §3): no installer card needed to iterate.

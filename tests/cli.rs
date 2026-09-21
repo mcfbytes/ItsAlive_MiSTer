@@ -65,6 +65,12 @@ fn every_argument_error_exits_2() {
         &["fb", "enable", "--mode", "240p"],
         &["say"],
         &["say", "--quiet", "hi"],
+        &["image"],
+        &["image", "--clear"],
+        &["image", "--size", "320", "a.raw"],
+        &["image", "--size", "320x0", "a.raw"],
+        &["image", "--mode", "720p", "a.raw"],
+        &["image", "a.raw", "b.raw"],
         &["up", "--off"],
         &["up", "--mode", "720i"],
         &["leds", "0xFF"],
@@ -90,6 +96,7 @@ fn help_exits_0_on_stdout() {
         assert_eq!(out.status.code(), Some(0));
         let text = stdout(&out);
         assert!(text.contains("itsalive fb enable"), "stdout was {text:?}");
+        assert!(text.contains("itsalive image"), "stdout was {text:?}");
         assert!(text.contains("exit codes:"), "stdout was {text:?}");
         // `leds` is v1.1 and not implemented; the usage text must not offer it.
         assert!(!text.contains("leds"), "stdout was {text:?}");
