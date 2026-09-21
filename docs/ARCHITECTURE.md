@@ -269,13 +269,21 @@ parts are unit-tested on the host.
 ```
 src/
   main.rs        argument parsing (hand-rolled; no clap), exit codes, logging
-  mailbox.rs     /dev/mem mapping, spi_w, enable/disable, bounded polling
+  mailbox.rs     spi_w, enable/disable, bounded polling, over a two-register trait
   video.rs       Modeline, vmodes subset, PLL solver, SET_VIDEO word composer
-  adv7513.rs     bus discovery, SMBus writes, the three tables
-  fb.rs          SET_FBUF composer, sysfs mode write
+  adv7513.rs     the three tables, the chip address, the three mode registers
+  fb.rs          SET_FBUF composer, the text of the sysfs mode line
   say.rs         write text to /dev/tty1 (v1); direct 8x16 draw is a later task
-  hw.rs          the only module that touches /dev/mem, /dev/i2c-*, sysfs, tty
+  hw.rs          the only module that touches /dev/mem, /dev/i2c-*, sysfs, tty:
+                 the mmapped Regs, I2C bus discovery and writes, the two writers
 ```
+
+The three lines that moved are `mailbox.rs`'s mapping, `adv7513.rs`'s bus
+discovery and SMBus writes, and `fb.rs`'s sysfs write: the I/O of all three
+lives in `hw.rs`, which is what the last line of the list said all along, and
+the modules above it are left pure. The traits `hw.rs` publishes
+(`mailbox::Regs`, `hw::I2cBus`, `hw::ModeSink`, `hw::TextSink`) are the seam,
+so the CLI is driven end to end by fakes.
 
 Rules:
 
@@ -294,7 +302,14 @@ Rules:
   (`armv7-unknown-linux-gnueabihf`); the crate must also build for
   `armv7-unknown-linux-musleabihf` with `+crt-static`, since that is what
   the installer config on `master` still says today. No `std` features that
-  differ between the two.
+  differ between the two. Two `libc` types *do* differ between them and both
+  are load-bearing in `hw.rs`: `libc::Ioctl` is `c_ulong` on gnueabihf and
+  `c_int` on musleabihf, so ioctl request numbers are written in that type
+  rather than a hardcoded one; and `libc::off_t` is 32-bit on gnueabihf but
+  64-bit on musleabihf, which `0xFF706000` does not fit in, so the `/dev/mem`
+  mapping calls `mmap64` on glibc and `mmap` elsewhere (Main_MiSTer gets the
+  same wide call from `-D_FILE_OFFSET_BITS=64`, `Makefile:52`). Neither can be
+  settled by reasoning: both targets get built.
 - **No panics on the hardware paths.** Every error is a typed enum mapped to
   an exit code (§7). `unwrap()` is banned outside tests.
 
