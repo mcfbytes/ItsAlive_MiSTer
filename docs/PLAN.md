@@ -22,31 +22,51 @@ on phase 3.
 
 ## 2. Unknowns only the rig can settle
 
-Listed with the expected answer and what changes if it is wrong.
+**All eleven were settled on 2026-09-21** — see
+[`testlogs/2026-09-21-rig-first-light.md`](testlogs/2026-09-21-rig-first-light.md)
+for the commands, the register dumps and what the monitor showed. Each is kept
+below with its original reasoning intact, so that a wrong prediction stays
+visible as a wrong prediction, followed by what the rig returned.
 
 1. **Does fbcon bind to `MiSTer_fb` and follow the sysfs mode change without
    Main?** Expected yes: stock's script terminal relies on exactly this, and
    `CONFIG_FRAMEBUFFER_CONSOLE=y`, `CONFIG_VT=y`, `CONFIG_FONT_8x16=y` are in
    our resolved kernel config. If no: `say` gets a direct-draw path (phase 5)
    that renders an embedded 8x16 font into `/dev/fb0` itself.
+
+   **Answered 2026-09-21: yes.** `vtcon1` is `(M) frame buffer device` with
+   `bind=1`, and `say` painted both lines. No direct-draw path needed.
 2. **Are the fabric's DDR read ports out of reset when U-Boot, not Main,
    loaded the core?** Expected yes: stock U-Boot's boot command runs
    `bridge enable` after loading the bitstream (Buildroot_MiSTer
    `docs/boot-chain.md` §6). If no: the frame reader scans garbage or hangs
    the AXI; step 3 in `hdmi` would still work, so the picture would be the
    core's own and `fb enable` gets a bridge-state check.
+
+   **Answered 2026-09-21: yes.** `fb enable` gave clean black, not garbage, and
+   `0xFFC25080` read `0x00003FFF` before anything ran. No bridge check added.
 3. **Which `/dev/i2c-N` carries the ADV7513 in the installer kernel?**
    Expected `/dev/i2c-1` as in stock, discovered by probing 0 to 2. The
    installer kernel is our normal kernel relinked with a different
    initramfs, so the DT is the same.
+
+   **Answered 2026-09-21: `/dev/i2c-1`**, chosen unaided from three candidates,
+   no `AmbiguousBus`. Checked on the installed system only; the installer
+   kernel remains inferred from the shared DT.
 4. **Does the installer's `console=ttyS0` cmdline leave `/dev/tty1` usable
    for `say`?** Expected yes: VT devices exist independent of which console
    gets printk. If no: same fallback as 1.
+
+   **Answered 2026-09-21: yes**, on the installed system. Untested under the
+   installer's `console=ttyS0`, which is Phase 4's to confirm.
 5. **Does the menu core light the I/O board Power LED before Main
    attaches?** From `sys_top.v` and `Menu.sv` it should breathe (the core
    drives `LED_POWER[1]=1` with a PWM sawtooth on `[0]` while `FB` is off).
    Not needed by this tool, but worth one glance during phase 3 because it
    answers Buildroot_MiSTer ADR 0020 §7's open question for free.
+
+   **Answered 2026-09-21: yes** — observed breathing throughout, with no Main
+   attached. ADR 0020 §7 can be closed on this.
 6. **Is the core actually found in reset, so that the GPO-zero store
    matters?** `Mailbox::new` writes GPO = 0 because releasing a latched
    core reset needs `GPO[31:30]` sampled `2'b00` then `2'b10` (ARCHITECTURE
@@ -56,11 +76,18 @@ Listed with the expected answer and what changes if it is wrong.
    store is correct either way and costs one word. If the screen is dark,
    this is not the thing to suspect first — but it is worth confirming the
    store is on the wire before suspecting anything else.
+
+   **Answered 2026-09-21: unprovable, as expected.** GPO read `0x00000000` at
+   cold boot, so our store was a no-op on this path and its necessity stays
+   unsettled. It costs one word and is correct either way; keep it.
 7. **Does `0x94 = 0x00` cost anything visible?** ARCHITECTURE §4 records it
    as our one deliberate byte divergence from stock in the 92. Nothing here
    reads the ADV7513 INT pin, so expect no difference; verify rather than
    assume, and if a sink refuses to lock, try `0xC0` before suspecting the
    tables.
+
+   **Answered 2026-09-21: nothing.** The sink locked and held for the whole
+   session. Keep `0x00`.
 8. **Does the sink lock without the SPD InfoFrame?** Stock's steady state
    has `0x40` bit 6 set, through a read-modify-write on a path we do not
    walk, so stock settles at `0x40 = 0x40` and we stay at `0x00`. The C
@@ -72,6 +99,10 @@ Listed with the expected answer and what changes if it is wrong.
    sub-map of the *already-pinned* bus), never a bare bit-set — enabling a
    packet with no packet memory behind it is a state the C deliberately
    refuses.
+
+   **Answered 2026-09-21: it locks.** We stayed at `0x40 = 0x00` across `hdmi`,
+   `fb enable`, `say` and two blits with no loss of sync, and `0x42` reached
+   Main's own `0xf8`. The faithful sequence stays unimplemented, on evidence.
 9. **Does fbcon fight `itsalive image` for the same pixels?** They write
    the same `/dev/fb0`: `say` goes through the console and `image` writes it
    directly (ARCHITECTURE §5). Expect the last writer to win, and expect
@@ -83,6 +114,11 @@ Listed with the expected answer and what changes if it is wrong.
    console has to be given up altogether (`setterm -cursor off`,
    `con2fbmap`). This is the question that decides whether the installer can
    mix `say` and `image` or has to choose one.
+
+   **Answered 2026-09-21: it can mix them.** The cursor did land on the image,
+   and `echo 0 > /sys/class/graphics/fbcon/cursor_blink` was enough on its own
+   — no `con2fbmap`, no `KD_GRAPHICS`. The knob is volatile (back to `1` after
+   reboot), so the installer sets it per boot and never restores it.
 10. **Does `write(2)` to `/dev/fb0` reach the fabric's frame reader?** It
    should: `.fb_write = fb_sys_write` (`MiSTer_fb.c:137`) copies into
    `screen_base`, which is a `memremap(..., MEMREMAP_WT)` write-through
@@ -91,11 +127,17 @@ Listed with the expected answer and what changes if it is wrong.
    does, the difference is the offset: fbcon starts at `screen_base` too, so
    suspect the geometry read-back before suspecting the write.
 
+   **Answered 2026-09-21: yes.** 3686400 bytes landed in 0.132 s, ~27 MB/s, and
+   the picture was correct to the pixel.
+
 11. **Before blaming this tool for a dark screen**, check the f2sdram
    bridges are up: `devmem2 0xFFC25080` should read `0x00003FFF`. They are
    raised by U-Boot's `bridge enable`, not by anything in userspace, and
    without them the fabric cannot reach HPS DDR at `0x22000000` at all —
    `hdmi` would still work and `fb enable` would scan nothing.
+
+   **Answered 2026-09-21:** `0x00003FFF` both with Main running and at cold
+   boot with no Main. U-Boot raises them and nothing lowers them.
 
 A note on diagnosis, because three of these produce the same symptom: a
 missing §1 step 3, an unreleased core reset, and painting before the sysfs
@@ -105,6 +147,15 @@ wire and cheapest to confirm.
 
 ## 3. Rig protocol (phase 3)
 
+**Run on 2026-09-21; steps 1-6b, 6c's full-screen half and 8 passed.** The
+results are in
+[`testlogs/2026-09-21-rig-first-light.md`](testlogs/2026-09-21-rig-first-light.md),
+which also lists the four steps that were *not* run and remain open: `--size`
+centring on hardware (6c), `say` after `image` (6d), `image` before
+`fb enable` (6's trailing paragraph), and 480p (7). The protocol is kept here
+in full because those four still need running, and because a second board or a
+second core reruns all of it.
+
 Rig: the DE10-Nano at `192.168.0.160` (`mister.lan`), SSH key
 `mister_rig_ed25519`, serial console available, netconsole receiver on
 `ubuntu01`. Runs from the *installed* system, which already has the menu
@@ -112,9 +163,15 @@ core in the fabric:
 
 1. Copy the cross-built `itsalive` to `/tmp` on the rig (not to the exFAT
    card; nothing persists).
-2. Stop the daemon and its respawn (`killall MiSTer`; check `inittab` for
-   the respawn line and hold it). Confirm HDMI goes to whatever the core
-   shows without Main. Note it.
+2. Stop Main. `killall MiSTer` is enough and is permanent until the next
+   boot: `/etc/inittab:61` is `::sysinit:/media/fat/MiSTer &`, which is
+   **`sysinit`, not `respawn`** — Main is started once and backgrounded, and
+   nothing restarts it. (This step previously said to find and hold a respawn
+   line. There is no respawn line; the 2026-09-21 session corrected it.)
+   Stricter, and what that session actually did: rename the binary to
+   `MiSTer.off` and power-cycle, which also exercises the cold-boot path the
+   installer will really run on. Confirm HDMI goes to whatever the core shows
+   without Main. Note it.
 3. `itsalive probe --json` → log.
 4. `itsalive hdmi` → expect the menu core's own picture. Log dmesg, exit
    code, the monitor's reported mode. If the monitor says NO SIGNAL rather
@@ -170,7 +227,11 @@ core in the fabric:
    deliberately does not.
 7. `itsalive hdmi --mode 480p` after `fb disable` → expect a picture again.
 8. Restart Main (or reboot). Confirm Main comes up normally after the tool
-   touched the fabric; log it.
+   touched the fabric; log it. **Passed 2026-09-21, and more strongly than
+   this asks:** Main not only restarted, it loaded a *different* bitstream
+   into the fabric we had been driving and ran a core, with every ADV7513
+   register back to its baseline and nothing angry in dmesg. This is the step
+   that says the tool is safe to hand to an installer.
 9. Write `docs/testlogs/YYYY-MM-DD-rig-first-light.md` with the
    `probe --json` output, every exit code, and photos or a description of
    what the monitor showed at each step.

@@ -26,13 +26,25 @@ itsalive image splash.raw    # or a picture: raw BGRX8888, centred, no scaling
 
 ## Status
 
-**Planning.** Nothing runs yet. Read, in order:
+**Working on hardware.** On 2026-09-21 a DE10-Nano with no Main_MiSTer on the
+card went from a dark HDMI output to a 1280x720 picture, then console text,
+then a full-screen image, driven only by the `menu.rbf` U-Boot had already
+loaded — and Main was restored afterwards, reloaded the fabric with a different
+core, and ran a game. All eleven of the questions only hardware could answer
+are settled. Four protocol steps remain unrun, listed at the end of that log.
+
+Next is Phase 4: packaging this for the Buildroot_MiSTer installer, where the
+binary is static musl in an initramfs rather than the glibc build tested so far.
+
+Read, in order:
 
 1. [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) — what the hardware needs, where every
    register sequence comes from, and how the crate is cut.
-2. [`docs/PLAN.md`](docs/PLAN.md) — phases, the rig verification protocol, the open
-   questions only hardware can answer, and the risks.
-3. [`TASKS.md`](TASKS.md) — the task list the implementation agents work from.
+2. [`docs/PLAN.md`](docs/PLAN.md) — phases, the rig verification protocol, the
+   questions hardware answered, and the risks.
+3. [`docs/testlogs/2026-09-21-rig-first-light.md`](docs/testlogs/2026-09-21-rig-first-light.md)
+   — what the board actually did, register by register.
+4. [`TASKS.md`](TASKS.md) — the task list the implementation agents work from.
 
 ## What it is not
 
