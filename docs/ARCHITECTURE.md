@@ -384,6 +384,21 @@ bitstream the HPS i2c peripheral is not routed to the chip, so without it the
 92 bulk writes would all NAK into the void before the first mailbox word
 produced exit 10 anyway.
 
+**Before the first write, and before the i2c bus is opened.** Bus discovery
+(§4) probes `0x39` on all three adapters, and on an unconfigured fabric none of
+them can answer, so a scan that runs first turns an empty fabric into exit 12 —
+"ADV7513 not found on any bus", a hardware-absent diagnosis for a board whose
+only problem is an unloaded core — and the *same board* then answers 10 to
+`probe` and `fb enable` and 12 to `hdmi` and `up`. The GPI read therefore comes
+before the `open`, in the two subcommands that touch both devices.
+
+`hdmi --off` is guarded too, and it is the one place this costs something: a
+single `0x41 = 0x50` write now needs `/dev/mem` open as well, and can report
+exit 14 where it would otherwise have reported 12. That is the right trade —
+an i2c write on an empty fabric reaches nothing either, and unguarded the NAK
+is logged and swallowed (§4) and `--off` exits 0 having changed nothing — and
+the installer never calls `--off` (§8).
+
 Every hardware subcommand is idempotent: running `hdmi` twice is harmless,
 and `fb enable` after `hdmi` after `up` is harmless.
 

@@ -14,8 +14,14 @@
 //!    §1's table fixes and nothing about how a file is opened, which is what
 //!    lets the end-to-end test drive them with recording fakes and assert one
 //!    ordered list of events across all three channels.
-//! 3. **[`execute`]**, the only place that names a real device, and [`main`],
-//!    which is a [`Result`] to exit-code adapter and no more.
+//! 3. **[`dispatch`]**, which says what each [`Command`] opens, in which
+//!    order, and which sequence it then runs; **[`execute`]**, the only place
+//!    that names a real device, which is [`dispatch`] with the five real
+//!    openers handed in; and [`main`], which is a [`Result`] to exit-code
+//!    adapter and no more. The openers are parameters so that the wiring —
+//!    `up` is both halves, `--off` is one register, the fabric is asked
+//!    before the i2c bus is opened — is asserted by tests and not only by
+//!    reading this file.
 //!
 //! # Exit codes, and why nothing here may panic
 //!
@@ -30,7 +36,7 @@
 //! through [`hw::log`] and `probe`'s findings through [`out`], which drop the
 //! error instead (see [`hw::log`]'s doc for the whole argument).
 
-use itsalive::hw::{I2cBus, ModeSink};
+use itsalive::hw::{I2cBus, ModeSink, TextSink};
 use itsalive::mailbox::{Deadline, Mailbox, MonotonicDeadline, Regs};
 use itsalive::video::Modeline;
 use itsalive::{Error, Result, adv7513, fb, hw, mailbox, say, video};
@@ -81,25 +87,35 @@ fn main() -> ExitCode {
             if matches!(err, Error::Usage(_)) {
                 hw::log(format_args!("{USAGE}"));
             }
-            // Unreachable fallback: every code in §7's table is 0..=14, so the
-            // conversion from `exit_code()`'s `i32` cannot fail. 2 is the
-            // "bug in the caller" code, which is what a new out-of-range
-            // variant would be.
-            ExitCode::from(u8::try_from(err.exit_code()).unwrap_or(2))
+            ExitCode::from(status(&err))
         }
     }
 }
 
+/// The byte an [`Error`] becomes in the process's wait status.
+///
+/// Named rather than inlined into [`main`] so that the table test below can
+/// assert the number the *shell* sees for every variant, not just the
+/// `exit_code()` the [`Error`] reports. `tests/cli.rs` closes the same gap
+/// from the outside, but only for the codes a build host can provoke without
+/// a device node — 2 and 0 — so this is the only place 10 through 14 are
+/// pinned to the conversion.
+///
+/// The fallback is unreachable: every code in §7's table is 0..=14, so the
+/// conversion from `exit_code()`'s `i32` cannot fail. 2 is the "bug in the
+/// caller" code, which is what a new out-of-range variant would be.
+fn status(err: &Error) -> u8 {
+    u8::try_from(err.exit_code()).unwrap_or(2)
+}
+
 /// Parse, then do. Split out of [`main`] so that the argument tests can call
 /// it without an [`ExitCode`] in the way.
+///
+/// `--help` needs no special case here: [`execute`] hands [`dispatch`] the
+/// device openers as closures, and [`Command::Help`] returns before any of
+/// them is called.
 fn run(args: &[String]) -> Result<()> {
-    match parse(args)? {
-        Command::Help => {
-            out(format_args!("{USAGE}"));
-            Ok(())
-        }
-        cmd => execute(cmd),
-    }
+    execute(parse(args)?)
 }
 
 /// Put one line on **stdout**, and survive a stdout that will not take it.
@@ -301,7 +317,13 @@ fn mode_names() -> String {
 /// (`fpga_io.cpp:655-662`): one read of GPI, no transfer, no side effect, and
 /// bit 31 clear means the FPGA is in user mode.
 fn fabric_ready<R: Regs>(regs: &R) -> bool {
-    regs.gpi_read() & mailbox::GPI_NOT_READY == 0
+    gpi_ready(regs.gpi_read())
+}
+
+/// The same question asked of a GPI word that has already been read, which is
+/// what `probe` has: it wants the number for its line as well as the verdict.
+fn gpi_ready(gpi: u32) -> bool {
+    gpi & mailbox::GPI_NOT_READY == 0
 }
 
 /// Refuse early when the fabric is unconfigured.
@@ -387,10 +409,28 @@ where
 
 /// `hdmi --off`: `0x41 = 0x50` and nothing else (§4, `video.cpp:2737-2745`).
 ///
-/// No mailbox, no PLL, no bulk table — so this path never opens `/dev/mem`
-/// either. Through [`hw::write_table`] like every other i2c write here, so a
-/// NAK is logged and tolerated rather than turned into exit 14.
-fn hdmi_off<B: I2cBus + ?Sized>(bus: &mut B) -> Result<()> {
+/// No PLL and no bulk table — but the mailbox is here all the same, for its
+/// GPI read and nothing else. §7 says the bitstream check guards `hdmi`, and
+/// `--off` is an `hdmi` invocation: it is one i2c write, and on an
+/// unconfigured fabric an i2c write reaches nothing, because the HPS i2c
+/// peripheral is routed to the chip through the fabric (§1). Without the
+/// check the caller is told "no ADV7513 found on any i2c bus" (exit 12) —
+/// a hardware-absent diagnosis for a board whose only problem is an empty
+/// fabric — or, if something does answer at `0x39`, the NAK is swallowed by
+/// [`hw::write_table`] and the run exits 0 having changed nothing. The price
+/// is that `--off` now needs `/dev/mem` and can therefore report exit 14
+/// where it used to report 12; both are "continue silently" to the installer,
+/// and §8 never calls `--off` anyway.
+///
+/// The write goes through [`hw::write_table`] like every other i2c write
+/// here, so a NAK is logged and tolerated rather than turned into exit 14.
+fn hdmi_off<R, D, B>(mb: &Mailbox<R, D>, bus: &mut B) -> Result<()>
+where
+    R: Regs,
+    D: Deadline,
+    B: I2cBus + ?Sized,
+{
+    require_bitstream(mb)?;
     let (reg, value) = adv7513::POWER_DOWN;
     let refused = hw::write_table(bus, [adv7513::POWER_DOWN]);
     hw::log(format_args!(
@@ -539,6 +579,43 @@ impl Finding {
 /// `i2c_open()` performs (`smbus.cpp:250-257`). The sysfs question is a
 /// `stat`.
 fn probe_findings() -> (Vec<Finding>, Option<Error>) {
+    probe_findings_with(
+        // One `mmap` of the FPGA manager page, one read, one `munmap`: the
+        // `MemRegs` is dropped at the end of the closure.
+        || hw::MemRegs::open().map(|regs| regs.gpi_read()),
+        || {
+            hw::I2c::open_adv7513().map(|i2c| {
+                // `i2c` drops with the closure, which closes the bus:
+                // `probe` leaves nothing open behind it.
+                format!(
+                    "ADV7513 at {:#04X} on {}",
+                    i2c.addr(),
+                    hw::bus_path(i2c.bus())
+                )
+            })
+        },
+        || {
+            std::fs::metadata(hw::FB_MODE_PATH)
+                .map(|_| format!("{} present", hw::FB_MODE_PATH))
+                .map_err(|e| Error::io(format!("stat {}", hw::FB_MODE_PATH), e))
+        },
+    )
+}
+
+/// [`probe_findings`] with its three questions handed in, which is the only
+/// way it can be run on a build host.
+///
+/// Each question is a closure because each opens something different and two
+/// of the three cannot succeed off a MiSTer; what is worth testing is not the
+/// opening but what this function does with the answers — the order of the
+/// findings, which failure becomes the exit code, and that a failed question
+/// does not stop the next one being asked. `bitstream` returns the GPI word
+/// rather than a verdict so that the "ok" line can print the number.
+fn probe_findings_with(
+    bitstream: impl FnOnce() -> Result<u32>,
+    adv7513: impl FnOnce() -> Result<String>,
+    fb_mode: impl FnOnce() -> Result<String>,
+) -> (Vec<Finding>, Option<Error>) {
     let mut findings = Vec::new();
     let mut first: Option<Error> = None;
     let mut record = |finding: Finding, err: Option<Error>| {
@@ -551,55 +628,34 @@ fn probe_findings() -> (Vec<Finding>, Option<Error>) {
     };
 
     // 1. Is there a bitstream in the fabric? (§2's GPI bit 31.)
-    match hw::MemRegs::open() {
-        Ok(regs) => {
-            let gpi = regs.gpi_read();
-            if fabric_ready(&regs) {
-                record(
-                    Finding::ok(
-                        "bitstream",
-                        format!("fabric in user mode (GPI {gpi:#010X})"),
-                    ),
-                    None,
-                );
-            } else {
-                record(
-                    Finding::failed("bitstream", &Error::NoBitstream),
-                    Some(Error::NoBitstream),
-                );
-            }
-        }
+    match bitstream() {
+        Ok(gpi) if gpi_ready(gpi) => record(
+            Finding::ok(
+                "bitstream",
+                format!("fabric in user mode (GPI {gpi:#010X})"),
+            ),
+            None,
+        ),
+        Ok(_) => record(
+            Finding::failed("bitstream", &Error::NoBitstream),
+            Some(Error::NoBitstream),
+        ),
         Err(err) => record(Finding::failed("bitstream", &err), Some(err)),
     }
 
     // 2. Which i2c bus is the ADV7513 on? (§4's discovery and its two
     //    refusals, exit 12 and exit 13.)
-    match hw::I2c::open_adv7513() {
-        Ok(i2c) => {
-            let detail = format!(
-                "ADV7513 at {:#04X} on {}",
-                i2c.addr(),
-                hw::bus_path(i2c.bus())
-            );
-            // `i2c` drops at the end of this arm, which closes the bus:
-            // `probe` leaves nothing open behind it.
-            record(Finding::ok("adv7513", detail), None);
-        }
+    match adv7513() {
+        Ok(detail) => record(Finding::ok("adv7513", detail), None),
         Err(err) => record(Finding::failed("adv7513", &err), Some(err)),
     }
 
     // 3. Is the kernel's geometry knob there? Without it `fb enable` reaches
     //    the fabric and then fails at the sysfs write with exit 14, which is
     //    exactly what this reports in advance.
-    match std::fs::metadata(hw::FB_MODE_PATH) {
-        Ok(_) => record(
-            Finding::ok("fb_mode", format!("{} present", hw::FB_MODE_PATH)),
-            None,
-        ),
-        Err(e) => {
-            let err = Error::io(format!("stat {}", hw::FB_MODE_PATH), e);
-            record(Finding::failed("fb_mode", &err), Some(err));
-        }
+    match fb_mode() {
+        Ok(detail) => record(Finding::ok("fb_mode", detail), None),
+        Err(err) => record(Finding::failed("fb_mode", &err), Some(err)),
     }
 
     (findings, first)
@@ -673,9 +729,12 @@ fn json_string(s: &str) -> String {
     out
 }
 
-/// `probe`: ask, print, and exit with the first failing code.
-fn cmd_probe(json: bool) -> Result<()> {
-    let (findings, first) = probe_findings();
+/// `probe`: print every finding, and exit with the first failing code.
+///
+/// The asking is the caller's ([`dispatch`] passes [`probe_findings`]), so
+/// that this — "all three lines, then the first error" — can be asserted on a
+/// host with no fabric.
+fn cmd_probe(json: bool, (findings, first): (Vec<Finding>, Option<Error>)) -> Result<()> {
     let code = first.as_ref().map_or(0, Error::exit_code);
     if json {
         out(format_args!("{}", render_json(&findings, code)));
@@ -700,50 +759,109 @@ fn open_mailbox() -> Result<Mailbox<hw::MemRegs, MonotonicDeadline>> {
     ))
 }
 
-/// Open what the command needs, in the order §1's table uses it, and run it.
+/// Open what the command needs and run it, on the real devices.
+///
+/// Nothing but the five openers lives here: the ordering, the guards and the
+/// choice of sequence are [`dispatch`]'s, where a test can drive them.
 fn execute(cmd: Command) -> Result<()> {
+    dispatch(
+        cmd,
+        open_mailbox,
+        hw::I2c::open_adv7513,
+        hw::ModeFile::new,
+        hw::Tty::open,
+        probe_findings,
+    )
+}
+
+/// Which sequence a [`Command`] is, what it opens, and in which order.
+///
+/// **The openers are closures, and that is the point.** Each is called only
+/// by the arms that need it, so `say` never opens `/dev/mem` and `--help`
+/// opens nothing at all; and because they are parameters, the test below can
+/// hand every arm the same recording fakes the sequence tests use and assert
+/// that `up` is `hdmi` *and* the frame buffer, that `hdmi --off` is one
+/// register, and that the two arms which touch both devices ask the fabric
+/// before they open the bus.
+///
+/// **Why the fabric is asked here and not only inside the sequences.** §7
+/// promises exit 10 for a board with no bitstream, and
+/// [`require_bitstream`]'s own argument is that the check must come before
+/// the first write. It has to come before the i2c bus is *opened* as well:
+/// discovery probes `0x39` on all three buses (§4), with no bitstream the
+/// chip is not reachable at all (§1), so every probe NAKs and the caller is
+/// told exit 12 — "ADV7513 not found on any i2c bus", a hardware-absent
+/// diagnosis for a board whose only problem is an empty fabric — before
+/// `hdmi_on` gets to ask anything. One GPI read, before the open, is what
+/// keeps `hdmi`, `fb` and `up` all answering 10 to the same board. The
+/// sequences keep their own check as well: it costs a load, and it is what
+/// makes them self-contained for a direct caller.
+fn dispatch<R, D, B, M, T>(
+    cmd: Command,
+    mailbox: impl FnOnce() -> Result<Mailbox<R, D>>,
+    i2c: impl FnOnce() -> Result<B>,
+    mode_sink: impl FnOnce() -> M,
+    tty: impl FnOnce() -> Result<T>,
+    findings: impl FnOnce() -> (Vec<Finding>, Option<Error>),
+) -> Result<()>
+where
+    R: Regs,
+    D: Deadline,
+    B: I2cBus,
+    M: ModeSink,
+    T: TextSink,
+{
     match cmd {
         Command::Help => {
             out(format_args!("{USAGE}"));
             Ok(())
         }
 
-        Command::Probe { json } => cmd_probe(json),
+        Command::Probe { json } => cmd_probe(json, findings()),
 
-        // `--off` is one i2c write: no mailbox, so no `/dev/mem`.
+        // `--off` is one i2c write, and it is still an i2c write: §7's GPI
+        // read guards it like the other three (see [`hdmi_off`]).
         Command::Hdmi { off: true, .. } => {
-            let mut bus = hw::I2c::open_adv7513()?;
-            hdmi_off(&mut bus)
+            let mb = mailbox()?;
+            require_bitstream(&mb)?;
+            let mut bus = i2c()?;
+            hdmi_off(&mb, &mut bus)
         }
 
         Command::Hdmi { mode, off: false } => {
-            let mut mb = open_mailbox()?;
-            let mut bus = hw::I2c::open_adv7513()?;
+            let mut mb = mailbox()?;
+            require_bitstream(&mb)?;
+            let mut bus = i2c()?;
             hdmi_on(&mut mb, &mut bus, &mode)
         }
 
+        // No guard here, and none in the `fb disable` arm: [`fb_enable`] and
+        // [`fb_disable`] ask the fabric as their first statement and nothing
+        // fallible is opened between the mailbox and that question, so their
+        // own check is already the first thing that can fail.
         Command::FbEnable { mode } => {
-            let mut mb = open_mailbox()?;
-            let mut sink = hw::ModeFile::new();
+            let mut mb = mailbox()?;
+            let mut sink = mode_sink();
             fb_enable(&mut mb, &mut sink, &mode)
         }
 
         Command::FbDisable => {
-            let mut mb = open_mailbox()?;
+            let mut mb = mailbox()?;
             fb_disable(&mut mb)
         }
 
         Command::Say { clear, text } => {
-            let mut tty = hw::Tty::open()?;
+            let mut tty = tty()?;
             say::say(&mut tty, clear, &text)
         }
 
         // One process, one mailbox, one i2c handle (§7's idempotence rule
         // plus §8's "the installer's one call").
         Command::Up { mode } => {
-            let mut mb = open_mailbox()?;
-            let mut bus = hw::I2c::open_adv7513()?;
-            let mut sink = hw::ModeFile::new();
+            let mut mb = mailbox()?;
+            require_bitstream(&mb)?;
+            let mut bus = i2c()?;
+            let mut sink = mode_sink();
             up(&mut mb, &mut bus, &mut sink, &mode)
         }
     }
@@ -752,7 +870,6 @@ fn execute(cmd: Command) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use itsalive::hw::TextSink;
     use itsalive::mailbox::{GPI_NOT_READY, SSPI_ACK, SSPI_IO_EN, SSPI_STROBE};
     use std::cell::RefCell;
     use std::rc::Rc;
@@ -784,6 +901,10 @@ mod tests {
         ModeLine(String),
         /// Bytes were written to the tty.
         Text(Vec<u8>),
+        /// [`dispatch`] called one of its openers: `"mailbox"`, `"i2c"`,
+        /// `"mode"` or `"tty"`. Only the dispatch tests see these; the
+        /// sequence tests call the sequences directly.
+        Open(&'static str),
     }
 
     type Log = Rc<RefCell<Vec<Event>>>;
@@ -956,11 +1077,10 @@ mod tests {
             .collect()
     }
 
-    /// The whole of `up` for 720p, as one ordered list.
-    fn expected_up_720p() -> Vec<Event> {
+    /// The `hdmi` half of a 720p run, as one ordered list.
+    fn expected_hdmi_720p() -> Vec<Event> {
         let mode = video::MODE_720P;
         let pll = video::solve_pll(mode.f_pix_mhz).expect("720p has a PLL solution");
-        let geom = fb::FbGeometry::for_mode(mode.hact, mode.vact, false);
 
         let mut expected = Vec::new();
 
@@ -993,13 +1113,85 @@ mod tests {
                 .map(|(reg, value)| Event::I2c(reg, value)),
         );
 
-        // 3. UIO_SET_FBUF and its ten words, then the sysfs line — fabric
-        //    first, sysfs second (§5).
-        expected.push(Event::EnableIo);
-        expected.push(Event::Word(mailbox::UIO_SET_FBUF));
+        expected
+    }
+
+    /// The `fb enable` half of a 720p run: the fabric burst, then the sysfs
+    /// line — fabric first, sysfs second (§5).
+    fn expected_fb_720p() -> Vec<Event> {
+        let geom = fb::FbGeometry::for_mode(1280, 720, false);
+        let mut expected = vec![Event::EnableIo, Event::Word(mailbox::UIO_SET_FBUF)];
         expected.extend(fb::enable_words(&geom).iter().map(|&w| Event::Word(w)));
         expected.push(Event::DisableIo);
         expected.push(Event::ModeLine("8888 1 1280 720 5120\n".to_string()));
+        expected
+    }
+
+    /// The whole of `up` for 720p, as one ordered list.
+    fn expected_up_720p() -> Vec<Event> {
+        let mut expected = expected_hdmi_720p();
+        expected.extend(expected_fb_720p());
+        expected
+    }
+
+    /// The whole of `up` for 480p, **from literals**.
+    ///
+    /// [`expected_up_720p`] takes its 26-word burst from
+    /// [`video::set_video_words`], which is the function under test: with the
+    /// mode written out on both sides of that call, hardcoding
+    /// `MODE_720P` inside [`hdmi_on`] changes neither side and the assertion
+    /// stays green. Only a second mode can catch that, and only if its
+    /// numbers come from somewhere else — so every mode-dependent word below
+    /// is a literal, taken from `docs/ARCHITECTURE.md` §3 (timings, and the
+    /// composition rule) and from `tests/golden/pll.json`'s 25.175 MHz row,
+    /// which the C generated: `c = 16`, `m = 8`, `k = 240518168`,
+    /// `item[9..20] = [4, 1028, 3, 65536, 5, 2056, 9, 2, 8, 7, 7, 240518168]`.
+    ///
+    /// The 92 bulk rows are mode-independent and stay table-derived;
+    /// `tests/adv7513_golden.rs` is what pins those to the C.
+    fn expected_up_480p() -> Vec<Event> {
+        let mut expected = Vec::new();
+
+        expected.extend(
+            adv7513::INIT
+                .iter()
+                .chain(adv7513::AUDIO)
+                .chain(adv7513::CSC)
+                .map(|&(reg, value)| Event::I2c(reg, value)),
+        );
+
+        // UIO_SET_VIDEO: `640 16 96 48 480 10 2 33` (§3's vmodes[6], VIC 1),
+        // with no polarity bits and no pixel repeat, then the PLL block:
+        // odd `item[i] | 0x4000`, even `item[i]` low half then high half.
+        expected.push(Event::EnableIo);
+        expected.push(Event::Word(mailbox::UIO_SET_VIDEO));
+        expected.extend(
+            [
+                640, 16, 96, 48, 480, 10, 2, 33, // timings
+                0x4004, 1028, 0, // item[9], item[10] = pll_div(M = 8)
+                0x4003, 0, 1, // item[11], item[12] = 0x10000
+                0x4005, 2056, 0, // item[13], item[14] = pll_div(C = 16)
+                0x4009, 2, 0, // item[15], item[16]
+                0x4008, 7, 0, // item[17], item[18]
+                0x4007, 0x0418, 0x0E56, // item[19], item[20] = K = 240518168
+            ]
+            .map(Event::Word),
+        );
+        expected.push(Event::DisableIo);
+
+        // `0x3C` is the VIC, 1 for 640x480 (§4).
+        expected.extend(
+            [(0x17u8, 0x62u8), (0x3B, 0x40), (0x3C, 0x01)]
+                .map(|(reg, value)| Event::I2c(reg, value)),
+        );
+
+        // UIO_SET_FBUF: format word, `FB_ADDR + 4096` in two halves, then the
+        // 640x480 geometry and a 2560-byte stride (§5).
+        expected.push(Event::EnableIo);
+        expected.push(Event::Word(mailbox::UIO_SET_FBUF));
+        expected.extend([0x8016, 0x1000, 0x2200, 640, 480, 0, 639, 0, 479, 2560].map(Event::Word));
+        expected.push(Event::DisableIo);
+        expected.push(Event::ModeLine("8888 1 640 480 2560\n".to_string()));
 
         expected
     }
@@ -1049,15 +1241,19 @@ mod tests {
         // (`video.cpp:1499`), and the last i2c write of the run is the VIC.
         let i2c = i2c_only(&events);
         assert_eq!(i2c.first().copied(), Some((0x98, 0x03)));
+        // Literals, not `INIT.len()` and `AUDIO.first()`: an assertion
+        // written in terms of the tables moves with them, so a dropped or
+        // duplicated table would keep it green. 51 rows of `init_data[]`
+        // ending `0xFA, 0x7D` (`video.cpp:1603`), then the audio table
+        // opening `0xAF, 0x06` (`:1422`) — the same counts
+        // `tests/adv7513_golden.rs` derives from the C.
         assert_eq!(
-            i2c.get(adv7513::INIT.len().saturating_sub(1)).copied(),
+            i2c.get(50).copied(),
             Some((0xFA, 0x7D)),
             "the INIT table ends where the AUDIO table begins"
         );
-        assert_eq!(
-            i2c.get(adv7513::INIT.len()).copied(),
-            adv7513::AUDIO.first().copied()
-        );
+        assert_eq!(i2c.get(51).copied(), Some((0xAF, 0x06)));
+        assert_eq!(i2c.len(), 92 + 3, "92 bulk writes and three mode registers");
         assert_eq!(
             i2c.get(i2c.len().saturating_sub(3)..),
             Some(&[(0x17, 0x62), (0x3B, 0x40), (0x3C, 0x04)][..])
@@ -1114,7 +1310,16 @@ mod tests {
     }
 
     /// 480p differs in every one of the numbers the spec says it should, and
-    /// in nothing else.
+    /// in nothing else — asserted word for word against
+    /// [`expected_up_480p`]'s literals.
+    ///
+    /// Two mutations this catches and the 720p test cannot, because there the
+    /// mode is hardcoded on both sides of the assertion: `solve(mode)` ->
+    /// `solve(&video::MODE_720P)` in [`hdmi_on`] (the 74.25 MHz PLL block
+    /// programmed for a 25.175 MHz mode) and `set_video_words(mode, &pll)` ->
+    /// `set_video_words(&video::MODE_720P, &pll)` (1280x720 timings sent to
+    /// the fabric while the chip is told VIC 1). Both are the green-log,
+    /// black-monitor failure the rig session is meant to be spared.
     #[test]
     fn up_480p_carries_the_480p_numbers() {
         let log = log_new();
@@ -1122,27 +1327,19 @@ mod tests {
         let mut bus = FakeBus::new(&log);
         let mut sink = FakeMode::new(&log);
         up(&mut mb, &mut bus, &mut sink, &video::MODE_480P).unwrap();
-        let events = events(&log);
 
-        let i2c = i2c_only(&events);
-        assert_eq!(
-            i2c.get(i2c.len().saturating_sub(3)..),
-            Some(&[(0x17, 0x62), (0x3B, 0x40), (0x3C, 0x01)][..]),
-            "VIC 1 for 640x480"
-        );
-        assert_eq!(
-            events.last(),
-            Some(&Event::ModeLine("8888 1 640 480 2560\n".to_string()))
-        );
+        assert_eq!(events(&log), expected_up_480p());
     }
 
     /// `hdmi --off` is one register and nothing else: no mailbox word, no
-    /// bulk table, no sysfs line (§4).
+    /// bulk table, no sysfs line (§4). The mailbox is there for the GPI read
+    /// and nothing else, so no word goes out on it.
     #[test]
     fn hdmi_off_writes_only_the_power_register() {
         let log = log_new();
+        let mb = Mailbox::new(FakeRegs::new(&log, 1), MonotonicDeadline::default());
         let mut bus = FakeBus::new(&log);
-        hdmi_off(&mut bus).unwrap();
+        hdmi_off(&mb, &mut bus).unwrap();
         assert_eq!(events(&log), vec![Event::I2c(0x41, 0x50)]);
         assert_eq!(adv7513::POWER_DOWN, (0x41, 0x50));
     }
@@ -1163,10 +1360,11 @@ mod tests {
                 .any(|e| matches!(e, Event::Word(0x2F) | Event::ModeLine(_))),
             "hdmi sent UIO_SET_FBUF or wrote sysfs"
         );
-        assert_eq!(
-            i2c_only(&events).len(),
-            adv7513::writes().count().saturating_add(3)
-        );
+        // 92 + 3, as literals: `adv7513::writes().count()` is the iterator
+        // under test, so both sides of that comparison would move together
+        // and a whole dropped table would keep this green. 51 + 13 + 28 is
+        // what `tests/adv7513_golden.rs` derives from the C.
+        assert_eq!(i2c_only(&events).len(), 92 + 3);
     }
 
     /// A core that answers `0` to `UIO_SET_FBUF` gets the opcode and nothing
@@ -1200,6 +1398,25 @@ mod tests {
                 Event::Word(0),
                 Event::DisableIo
             ]
+        );
+    }
+
+    /// A core that answers `0` is sent no `0` word either: the disable
+    /// payload sits inside the same `if (res)` as the enable payload
+    /// (`video.cpp:3481`, `:3527`), so [`fb_disable`] must use
+    /// [`Mailbox::command_if_supported`] and not [`Mailbox::command`].
+    /// Without this the two are indistinguishable, because a core that
+    /// answers `1` is sent the payload either way.
+    #[test]
+    fn an_unsupported_frame_buffer_is_not_sent_a_disable_word() {
+        let log = log_new();
+        let mut mb = Mailbox::new(FakeRegs::new(&log, 0), MonotonicDeadline::default());
+
+        fb_disable(&mut mb).unwrap();
+
+        assert_eq!(
+            events(&log),
+            vec![Event::EnableIo, Event::Word(0x2F), Event::DisableIo]
         );
     }
 
@@ -1264,6 +1481,50 @@ mod tests {
         assert!(events(&log).is_empty(), "wrote something with no bitstream");
     }
 
+    /// **Every** sequence asks, not just the first one `up` happens to call.
+    ///
+    /// [`no_bitstream_is_exit_10_before_anything_is_written`] drives `up`,
+    /// which reaches [`hdmi_on`]'s check first, so it says nothing about the
+    /// checks in [`fb_enable`], [`fb_disable`] and [`hdmi_off`] — deleting
+    /// any of those three left the whole suite green. A standalone
+    /// `itsalive fb enable` on an unconfigured fabric would then put the
+    /// opcode on the wire and spin until the 10 ms deadline, reporting exit
+    /// 11 where §7 promises 10.
+    #[test]
+    fn every_sequence_refuses_an_unconfigured_fabric_with_exit_10() {
+        let mut ran = 0usize;
+        let mut check = |name: &str, run: &dyn Fn(&Log) -> Result<()>| {
+            let log = log_new();
+            let err = run(&log).expect_err(name);
+            assert!(matches!(err, Error::NoBitstream), "{name}: {err}");
+            assert_eq!(err.exit_code(), 10, "{name}");
+            assert!(events(&log).is_empty(), "{name} wrote something");
+            ran += 1;
+        };
+
+        fn mailbox(log: &Log) -> Mailbox<FakeRegs, MonotonicDeadline> {
+            let mut regs = FakeRegs::new(log, 1);
+            regs.ready = false;
+            Mailbox::new(regs, MonotonicDeadline::default())
+        }
+
+        check("fb_enable", &|log| {
+            fb_enable(
+                &mut mailbox(log),
+                &mut FakeMode::new(log),
+                &video::MODE_720P,
+            )
+        });
+        check("fb_disable", &|log| fb_disable(&mut mailbox(log)));
+        check("hdmi_off", &|log| {
+            hdmi_off(&mailbox(log), &mut FakeBus::new(log))
+        });
+        check("hdmi_on", &|log| {
+            hdmi_on(&mut mailbox(log), &mut FakeBus::new(log), &video::MODE_720P)
+        });
+        assert_eq!(ran, 4);
+    }
+
     /// A fabric that never acks is exit 11, and the enable bit is dropped on
     /// the way out (`mailbox::Mailbox::command` does it on every path).
     #[test]
@@ -1314,6 +1575,268 @@ mod tests {
             events(&log),
             vec![Event::Text(b"\x1b[2J\x1b[HInstalling MiSTer...\n".to_vec())]
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // What each command is wired to
+    // -----------------------------------------------------------------------
+
+    /// Run [`dispatch`] against the recording fakes, the way [`execute`] runs
+    /// it against the real devices.
+    ///
+    /// The openers record too, so the event list says what was opened, in
+    /// which order, and — by their absence — what was not: this is what makes
+    /// "`say` never opens `/dev/mem`" and "the fabric is asked before the
+    /// bus" assertions rather than readings of the source.
+    fn run_dispatch(
+        cmd: Command,
+        log: &Log,
+        regs: FakeRegs,
+        bus: Result<FakeBus>,
+        findings: (Vec<Finding>, Option<Error>),
+    ) -> Result<()> {
+        dispatch(
+            cmd,
+            || {
+                log.borrow_mut().push(Event::Open("mailbox"));
+                Ok(Mailbox::new(regs, MonotonicDeadline::default()))
+            },
+            || {
+                log.borrow_mut().push(Event::Open("i2c"));
+                bus
+            },
+            || {
+                log.borrow_mut().push(Event::Open("mode"));
+                FakeMode::new(log)
+            },
+            || {
+                log.borrow_mut().push(Event::Open("tty"));
+                Ok(FakeTty {
+                    log: Rc::clone(log),
+                })
+            },
+            || findings,
+        )
+    }
+
+    /// A healthy board: fabric configured, chip on the bus, nothing to report.
+    fn healthy(log: &Log) -> (FakeRegs, Result<FakeBus>, (Vec<Finding>, Option<Error>)) {
+        (
+            FakeRegs::new(log, 1),
+            Ok(FakeBus::new(log)),
+            (Vec::new(), None),
+        )
+    }
+
+    /// `up` is `hdmi` **and** `fb enable` — §8's one call, whole.
+    ///
+    /// Every other test here drives the sequences directly, so wiring
+    /// `Command::Up` to `hdmi_on` alone would leave them all green while
+    /// `itsalive up` silently stopped switching `/dev/fb0` in.
+    #[test]
+    fn up_dispatches_to_both_halves() {
+        let log = log_new();
+        let (regs, bus, findings) = healthy(&log);
+        run_dispatch(
+            Command::Up {
+                mode: video::MODE_720P,
+            },
+            &log,
+            regs,
+            bus,
+            findings,
+        )
+        .unwrap();
+
+        let mut expected = vec![
+            Event::Open("mailbox"),
+            Event::Open("i2c"),
+            Event::Open("mode"),
+        ];
+        expected.extend(expected_up_720p());
+        assert_eq!(events(&log), expected);
+    }
+
+    /// `hdmi` stops after the three mode registers; `hdmi --off` is the one
+    /// power register. T2.2's "Done when" is about what `--off` writes, and
+    /// this is the only test that watches it through the CLI's own dispatch:
+    /// wiring `--off` to `hdmi_on` would otherwise power the chip *up* and
+    /// write 95 registers with every test still green.
+    #[test]
+    fn each_hdmi_form_dispatches_to_its_own_sequence() {
+        let log = log_new();
+        let (regs, bus, findings) = healthy(&log);
+        run_dispatch(
+            Command::Hdmi {
+                mode: video::MODE_720P,
+                off: false,
+            },
+            &log,
+            regs,
+            bus,
+            findings,
+        )
+        .unwrap();
+        let mut expected = vec![Event::Open("mailbox"), Event::Open("i2c")];
+        expected.extend(expected_hdmi_720p());
+        assert_eq!(events(&log), expected);
+
+        let log = log_new();
+        let (regs, bus, findings) = healthy(&log);
+        run_dispatch(
+            Command::Hdmi {
+                mode: video::MODE_720P,
+                off: true,
+            },
+            &log,
+            regs,
+            bus,
+            findings,
+        )
+        .unwrap();
+        assert_eq!(
+            events(&log),
+            vec![
+                Event::Open("mailbox"),
+                Event::Open("i2c"),
+                Event::I2c(0x41, 0x50)
+            ]
+        );
+    }
+
+    /// `fb enable` and `fb disable` reach the fabric and the sysfs knob and
+    /// never the i2c bus, which is why neither opens one.
+    #[test]
+    fn the_fb_commands_dispatch_without_an_i2c_bus() {
+        let log = log_new();
+        let (regs, bus, findings) = healthy(&log);
+        run_dispatch(
+            Command::FbEnable {
+                mode: video::MODE_720P,
+            },
+            &log,
+            regs,
+            bus,
+            findings,
+        )
+        .unwrap();
+        let mut expected = vec![Event::Open("mailbox"), Event::Open("mode")];
+        expected.extend(expected_fb_720p());
+        assert_eq!(events(&log), expected);
+
+        let log = log_new();
+        let (regs, bus, findings) = healthy(&log);
+        run_dispatch(Command::FbDisable, &log, regs, bus, findings).unwrap();
+        assert_eq!(
+            events(&log),
+            vec![
+                Event::Open("mailbox"),
+                Event::EnableIo,
+                Event::Word(0x2F),
+                Event::Word(0),
+                Event::DisableIo
+            ]
+        );
+    }
+
+    /// `say` opens the tty and nothing else. It runs on a board whose fabric
+    /// may be empty and whose `/dev/mem` may be unreadable, so an opener it
+    /// does not need must not be called (§8: nothing there may fail an
+    /// install).
+    #[test]
+    fn say_dispatches_to_the_tty_alone() {
+        let log = log_new();
+        let (regs, bus, findings) = healthy(&log);
+        run_dispatch(
+            Command::Say {
+                clear: false,
+                text: argv(&["hello"]),
+            },
+            &log,
+            regs,
+            bus,
+            findings,
+        )
+        .unwrap();
+        assert_eq!(
+            events(&log),
+            vec![Event::Open("tty"), Event::Text(b"hello\n".to_vec())]
+        );
+    }
+
+    /// `--help` opens nothing at all.
+    #[test]
+    fn help_dispatches_without_opening_anything() {
+        let log = log_new();
+        let (regs, bus, findings) = healthy(&log);
+        run_dispatch(Command::Help, &log, regs, bus, findings).unwrap();
+        assert!(events(&log).is_empty());
+    }
+
+    /// An empty fabric is exit 10 for `hdmi`, `hdmi --off` and `up`, not the
+    /// exit 12 the i2c scan would produce first.
+    ///
+    /// This is the failing input: a DE10-Nano that booted with no `menu.rbf`
+    /// in the fabric. The HPS i2c peripheral is routed to the chip *through*
+    /// the fabric (§1), so discovery NAKs on all three buses and
+    /// `open_adv7513` gives [`Error::NoAdv7513`] — which is what the fake
+    /// opener returns here. With the bus opened before the GPI read the
+    /// caller is told "no ADV7513 found at 0x39 on any i2c bus" and 12, while
+    /// `probe` and `fb enable` on the *same board* say 10.
+    #[test]
+    fn an_empty_fabric_is_exit_10_before_the_bus_is_opened() {
+        let cases = [
+            Command::Up {
+                mode: video::MODE_720P,
+            },
+            Command::Hdmi {
+                mode: video::MODE_720P,
+                off: false,
+            },
+            Command::Hdmi {
+                mode: video::MODE_720P,
+                off: true,
+            },
+        ];
+        for cmd in cases {
+            let log = log_new();
+            let mut regs = FakeRegs::new(&log, 1);
+            regs.ready = false;
+            let err = run_dispatch(
+                cmd.clone(),
+                &log,
+                regs,
+                Err(Error::NoAdv7513),
+                (Vec::new(), None),
+            )
+            .expect_err("an empty fabric must refuse");
+
+            assert!(matches!(err, Error::NoBitstream), "{cmd:?}: {err}");
+            assert_eq!(err.exit_code(), 10, "{cmd:?}");
+            assert_eq!(
+                events(&log),
+                vec![Event::Open("mailbox")],
+                "{cmd:?} opened the i2c bus, or wrote something, before asking"
+            );
+        }
+    }
+
+    /// `probe`'s exit code is the first failing finding's, through dispatch.
+    #[test]
+    fn probe_dispatches_to_the_findings_it_is_given() {
+        let log = log_new();
+        let (regs, bus, _) = healthy(&log);
+        let err = run_dispatch(
+            Command::Probe { json: true },
+            &log,
+            regs,
+            bus,
+            (sample_findings(), Some(Error::NoAdv7513)),
+        )
+        .expect_err("a failing finding is a failing exit");
+        assert_eq!(err.exit_code(), 12);
+        // Nothing was opened: `probe` asked its questions itself.
+        assert!(events(&log).is_empty());
     }
 
     // -----------------------------------------------------------------------
@@ -1547,14 +2070,99 @@ mod tests {
         ];
         for (err, code) in cases {
             assert_eq!(err.exit_code(), code, "{err}");
-            // Every code fits in the byte a process exit status carries.
-            assert!(u8::try_from(err.exit_code()).is_ok());
+            // ...and arrives in the wait status as that same number. `main`
+            // is `ExitCode::from(status(&err))` and nothing else, so this is
+            // the step `tests/cli.rs` can only close for 2 and 0: it runs the
+            // real binary, but every other code needs a device node.
+            assert_eq!(
+                i32::from(status(&err)),
+                code,
+                "{err} reaches the shell as a different number"
+            );
         }
     }
 
     // -----------------------------------------------------------------------
     // probe's rendering
     // -----------------------------------------------------------------------
+
+    /// Three findings, in §7's order, and no failure.
+    #[test]
+    fn probe_asks_its_three_questions_in_order() {
+        let (findings, first) = probe_findings_with(
+            || Ok(0x0000_0001),
+            || Ok("ADV7513 at 0x39 on /dev/i2c-1".to_string()),
+            || Ok(format!("{} present", hw::FB_MODE_PATH)),
+        );
+
+        let names: Vec<&str> = findings.iter().map(|f| f.name).collect();
+        assert_eq!(names, ["bitstream", "adv7513", "fb_mode"]);
+        assert!(findings.iter().all(|f| f.ok && f.code == 0));
+        assert!(first.is_none());
+        assert!(findings[0].detail.contains("GPI 0x00000001"));
+    }
+
+    /// GPI bit 31 is the no-bitstream answer, and a failed question does not
+    /// stop the next one: `probe` "prints one line per finding" (§7), so the
+    /// installer sees the whole picture even when the first thing it asked
+    /// was already wrong.
+    #[test]
+    fn probe_keeps_asking_after_a_failure_and_reports_the_first_code() {
+        let (findings, first) = probe_findings_with(
+            || Ok(GPI_NOT_READY),
+            || Err(Error::NoAdv7513),
+            || Ok(format!("{} present", hw::FB_MODE_PATH)),
+        );
+
+        assert_eq!(findings.len(), 3);
+        assert_eq!((findings[0].ok, findings[0].code), (false, 10));
+        assert_eq!((findings[1].ok, findings[1].code), (false, 12));
+        assert!(findings[2].ok, "the third question was not asked");
+        // First failure wins, not the last and not the worst.
+        assert_eq!(first.map(|e| e.exit_code()), Some(10));
+    }
+
+    /// A `/dev/mem` that will not open is the bitstream finding's own
+    /// failure, exit 14, and not a claim about the fabric.
+    #[test]
+    fn probe_reports_an_unreadable_dev_mem_as_exit_14() {
+        let (findings, first) = probe_findings_with(
+            || {
+                Err(Error::io(
+                    "open /dev/mem",
+                    std::io::Error::from_raw_os_error(libc::EACCES),
+                ))
+            },
+            || Ok("ADV7513 at 0x39 on /dev/i2c-1".to_string()),
+            || {
+                Err(Error::io(
+                    format!("stat {}", hw::FB_MODE_PATH),
+                    std::io::Error::from_raw_os_error(libc::ENOENT),
+                ))
+            },
+        );
+
+        assert_eq!(findings.len(), 3);
+        assert_eq!(first.map(|e| e.exit_code()), Some(14));
+        assert!(findings[0].detail.contains("/dev/mem"));
+        assert_eq!(findings[2].code, 14);
+    }
+
+    /// `cmd_probe` exits with the first failing code and 0 when nothing
+    /// failed, in both output shapes. What it prints is
+    /// [`render_lines`]/[`render_json`], which have their own tests below.
+    #[test]
+    fn cmd_probe_exits_with_the_first_failing_code() {
+        let err = cmd_probe(false, (sample_findings(), Some(Error::NoAdv7513)))
+            .expect_err("a failing finding is a failing exit");
+        assert_eq!(err.exit_code(), 12);
+
+        let err = cmd_probe(true, (sample_findings(), Some(Error::NoBitstream)))
+            .expect_err("--json changes the shape, not the code");
+        assert_eq!(err.exit_code(), 10);
+
+        cmd_probe(false, (sample_findings(), None)).expect("no failure is exit 0");
+    }
 
     fn sample_findings() -> Vec<Finding> {
         vec![
