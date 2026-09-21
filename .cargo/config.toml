@@ -1,0 +1,10 @@
+# Cross-linking without Docker: the gnueabihf target uses the Debian/Ubuntu
+# `gcc-arm-linux-gnueabihf` package; the musl target uses the LLVM linker that
+# ships with rustup plus the self-contained musl sysroot, so it needs nothing
+# installed at all.
+[target.armv7-unknown-linux-gnueabihf]
+linker = "arm-linux-gnueabihf-gcc"
+
+[target.armv7-unknown-linux-musleabihf]
+linker = "rust-lld"
+rustflags = ["-C", "target-feature=+crt-static", "-C", "link-self-contained=yes"]

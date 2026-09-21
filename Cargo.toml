@@ -1,0 +1,27 @@
+[package]
+name = "itsalive"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.97"
+description = "Bring up HDMI and the Linux framebuffer on a MiSTer without Main_MiSTer"
+license = "GPL-3.0-or-later"
+repository = "https://github.com/mcfbytes/ItsAlive_MiSTer"
+publish = false
+
+[lib]
+name = "itsalive"
+path = "src/lib.rs"
+
+[[bin]]
+name = "itsalive"
+path = "src/main.rs"
+
+[dependencies]
+libc = { version = "0.2", default-features = false, features = ["std"] }
+
+[profile.release]
+opt-level = "s"
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true
