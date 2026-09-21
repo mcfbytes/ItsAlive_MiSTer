@@ -38,8 +38,9 @@ visible as a wrong prediction, followed by what the rig returned.
    `bind=1`, and `say` painted both lines. No direct-draw path needed.
 2. **Are the fabric's DDR read ports out of reset when U-Boot, not Main,
    loaded the core?** Expected yes: stock U-Boot's boot command runs
-   `bridge enable` after loading the bitstream (Buildroot_MiSTer
-   `docs/boot-chain.md` §6). If no: the frame reader scans garbage or hangs
+   `bridge enable` on the same line that loads the bitstream --
+   `fpgaload` in `include/configs/socfpga_de10_nano.h:47` of
+   MiSTer-devel/U-Boot_MiSTer, traced in ARCHITECTURE §1. If no: the frame reader scans garbage or hangs
    the AXI; step 3 in `hdmi` would still work, so the picture would be the
    core's own and `fb enable` gets a bridge-state check.
 
@@ -272,6 +273,19 @@ start-up on the same board. Each divergence goes in the test log.
   `timeout`, all `|| true`. `scripts/test-installer-splash.sh` and
   `scripts/test-sdcard-install.sh` must pass with the binary absent (QEMU
   has no fabric) and with a stub that returns exit 10.
+- **The reformat must leave `menu.rbf` where U-Boot can find it.** This is a
+  dependency the splash work inherits rather than creates, and it is easy to
+  miss because it does not bite during the install. The FPGA is configured at
+  boot, from the *old* card, before the installer's initramfs exists
+  (ARCHITECTURE §1) -- so `itsalive` works throughout the reformat no matter
+  what happens to the filesystem underneath it. It bites on the *next* boot:
+  if the freshly written card has no `menu.rbf` at a path `load mmc 0:1` can
+  reach, U-Boot configures no fabric, and then neither Main nor this tool can
+  put up a picture. `probe` would exit 10, correctly and uselessly. Note also
+  that U-Boot reads that partition with ChaN's FatFs, patched in by the MiSTer
+  fork with `_FS_EXFAT 1`, not with stock U-Boot's FAT driver; an exFAT the
+  kernel mounts is not automatically an exFAT that U-Boot reads. Worth an
+  explicit assertion in `scripts/test-sdcard-install.sh` rather than trust.
 - Docs: ADR 0020 §6 amended with the outcome; `docs/user/sdcard-flashing.md`
   loses "the screen stays blank the whole time" once the card test confirms
   the splash. The "static-musl" wording for the installer in ADR 0020,

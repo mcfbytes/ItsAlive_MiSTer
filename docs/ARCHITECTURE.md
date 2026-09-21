@@ -21,9 +21,9 @@ HDMI output on the HPS having programmed that PLL. So:
   refuses cleanly (`probe` exit code) when there is none.
 - **With a core loaded, Main_MiSTer is not required.** Everything the daemon
   does to get a picture is three register sequences sent from userspace. The
-  installer already has `menu.rbf` in the fabric (U-Boot loads it before
-  Linux starts), so the daemon is the only missing piece, and it is a
-  replaceable one.
+  installer already has `menu.rbf` in the fabric — U-Boot configures it
+  before the kernel is even read off the card, traced below — so the daemon
+  is the only missing piece, and it is a replaceable one.
 
 The four sequences, in the order they must run:
 
@@ -66,6 +66,115 @@ the SPD InfoFrame, CEC, EDID parsing and interrupt arming. None of it is
 needed for a picture on a DVI or HDMI monitor. The 3-register mode write is
 **not** skipped: Main sends it for the menu core unconditionally and it is
 what fixes sync polarity for the preset modes (§3, §4).
+
+### How the core got there: U-Boot, before Linux
+
+Everything above rests on a precondition this tool cannot create and does not
+check beyond one bit: that the fabric already holds a core. It is worth knowing
+exactly how, because two of the things `itsalive` relies on are side effects of
+that process rather than of anything we do.
+
+File:line references in this subsection are against
+[MiSTer-devel/U-Boot_MiSTer](https://github.com/MiSTer-devel/U-Boot_MiSTer) at
+`8dcc3484aa`, **not** Main_MiSTer.
+
+`menu.rbf` is not named in any configuration file on the SD card. It is a
+compiled-in default environment variable, `include/configs/socfpga_de10_nano.h:45`:
+
+```c
+"core=menu.rbf\0" \
+```
+
+That header is reached because `configs/MiSTer_defconfig` sets
+`CONFIG_SYS_CONFIG_NAME="socfpga_de10_nano"`. From `CONFIG_BOOTCOMMAND` (`:23`)
+the chain is:
+
+```
+bootcmd      mw 0xff709004 0x800; run mmcload; run mmcboot
+mmcload :55  mmc rescan; run fpgacheck; run scrtest;
+             load mmc 0:1 $loadaddr /linux/zImage_dtb; ...
+fpgacheck:46 if mt 0x1FFFFF08 0xBEEFB001 ... else run fpgaload; fi
+fpgaload :47 load mmc 0:1 0x02000000 $core;   <- $core = menu.rbf
+             fpga load 0 0x02000000 $filesize;
+             bridge enable; mw 0x1FFFF000 0; mw 0xFFD05054 0
+mmcboot      setenv bootargs ...; bootz $loadaddr - $fdt_addr
+```
+
+`mt` is not stock U-Boot. It is a MiSTer addition, `cmd/mem.c:1260`
+(`do_mem_mt`, "memory test against value"), which is a `memcmp` returning
+success when memory *equals* the value.
+
+Three consequences matter here:
+
+1. **The fabric is configured before the kernel is read off the card**, let
+   alone executed: `run fpgacheck` precedes the `load` of `$bootimage` inside
+   `mmcload`, and `bootz` is a later command still. This is why a board with
+   no Main_MiSTer anywhere — no binary on the card at all — still has a core
+   in the fabric, and why `probe` found GPI bit 31 clear (`0x5CA623A4`) at
+   cold boot.
+2. **`bridge enable` on the `fpgaload` line is what raises the f2sdram
+   bridges**, measured as `0xFFC25080 = 0x00003FFF` on the rig both with and
+   without Main. Nothing in userspace raises them, which is why §5's frame
+   reader can reach HPS DDR at all and why `fb enable` needs no bridge check.
+3. **The mode the core comes up in is the core's own.** U-Boot configures the
+   FPGA and stops; it programs no PLL, touches no ADV7513. That is the gap
+   this tool exists to fill.
+
+A stock serial boot log (Buildroot_MiSTer
+`docs/testlogs/p1-first-boot-serial-stock.txt`) shows the order directly:
+
+```
+U-Boot SPL 2017.03+
+U-Boot 2017.03+
+*** Warning - bad CRC, using default environment
+reading menu.rbf
+2452588 bytes read in 168 ms (13.9 MiB/s)      <- fabric configured
+reading /linux/u-boot.txt
+26 bytes read in 4 ms
+## Info: input data size = 1005 = 0x3ED        <- cmd/nvedit.c:1065, env import
+reading /linux/zImage_dtb
+7380857 bytes read in 498 ms (14.1 MiB/s)      <- kernel only now read
+Starting kernel ...
+```
+
+`*** Warning - bad CRC, using default environment` is the load-bearing line.
+`CONFIG_ENV_IS_IN_MMC` is set and a saved environment would live at offset 512,
+just after the MBR, but none has ever been written — so U-Boot falls back to
+the compiled-in defaults, and `core=menu.rbf` demonstrably comes from the
+binary. A `saveenv` on a board would change that, and would be invisible from
+the card's filesystem.
+
+**`/linux/u-boot.txt` cannot select the core.** The file exists and does take
+effect — the rig's `/proc/cmdline` carries `loglevel=7 usbhid.jspoll=1
+panic=15` from it, against a compiled-in default of `v=loglevel=4` — but
+`scrtest` (`:48`), which imports it, runs *after* `fpgacheck` in `mmcload`. The
+FPGA is already configured by then. That file can only influence what is
+consumed later: the kernel image, bootargs, loglevel, MAC.
+
+**A core switch is a DDR handoff, not a file.** Main_MiSTer writes
+`0x1FFFFF08 = 0xBEEFB001` (warm-boot marker) and `0x1FFFF000 = 0x87654321`
+(env-blob marker) with a text environment at `0x1FFFF004`, then resets;
+`fpgacheck` imports that blob, which is where a different `core=` arrives.
+Both markers are cleared as they are consumed, so anything that is not a
+deliberate switch falls back to `menu.rbf`. The addresses sit in the 1 MB
+window Linux is told to leave alone — bootargs carry
+`mem=511M memmap=513M$511M`, and `0x1FFFF000` is ~511.996 MiB — which is why
+the handoff survives the reset.
+
+The two bare register writes: `0xff709004` is `SOCFPGA_GPIO1_ADDRESS`
+(`base_addr_ac5.h:17`) plus `0x04`, the DesignWare `GPIO_SWPORTA_DDR`
+direction register, and `0x800` makes bit 11 an output — a whole-register
+write, so every other GPIO1 pin becomes an input. `0xFFD05054` is
+`SOCFPGA_RSTMGR_ADDRESS` (`:34`) plus `0x54`, which walking
+`struct socfpga_reset_manager` (`reset_manager.h`) lands exactly on
+`tstscratch`, the scratch register that survives a warm reset.
+
+**The card is exFAT, and stock U-Boot cannot read exFAT.** MiSTer's fork
+grafts ChaN's FatFs R0.12c into `fs/fat/` (`ff.c`, `ff.h`, `ffconf.h` — none
+of which exist upstream) with `_FS_EXFAT 1` at `ffconf.h:212`. Anything that
+reformats the boot partition depends on that patch, and on `menu.rbf`
+surviving at a path `load mmc 0:1` can reach (PLAN §4).
+
 
 ## 2. The fabric mailbox ("SPI")
 
