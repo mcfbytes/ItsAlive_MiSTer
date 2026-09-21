@@ -74,6 +74,14 @@ word, send the payload words, drop `SSPI_IO_EN` (`DisableIO()`). Main leaves
 the enable bits in the shadow between calls; we start from a shadow of zero and
 always drop the enable on every exit path, including errors.
 
+Every word transfer returns a 16-bit reply, and one of our two commands reads
+it. `set_video()` throws the reply to its opcode away and sends all 26 payload
+words regardless (`video.cpp:2266-2294`). `video_fb_enable()` does not: its
+payload sits inside `if (res)` on the reply to `UIO_SET_FBUF`
+(`video.cpp:3480-3481`), so a core without the HPS frame buffer is sent the
+opcode and nothing else (§5). The mailbox therefore offers two senders — one
+ungated, one gated — and `UIO_SET_FBUF` uses the gated one.
+
 **Bounded, always.** Every ack poll gets a deadline (10 ms is generous; a
 healthy fabric acks in microseconds). A timeout is an error exit, not a hang.
 This tool runs inside an installer that must never be able to fail; the tool
@@ -177,7 +185,7 @@ Default mode: **1280x720@60**, `Fpix = 74.25`, timings
 
 ## 5. UIO_SET_FBUF: 10 words, plus the kernel knob
 
-From `video_fb_enable()` (`video.cpp:3474-3530`) with `n = 0` and no direct
+From `video_fb_enable()` (`video.cpp:3474-3543`) with `n = 0` and no direct
 video:
 
 ```
@@ -198,6 +206,17 @@ with `fb_addr = FB_ADDR + 4096` for buffer 0, `FB_ADDR = 0x22000000`
 (`video.cpp:37`, "512 MB + 32 MB"); the 4 KiB skip is the driver's header
 page. Width and height are the mode's active area (1280x720). Disable is the
 opcode followed by a single `0` word.
+
+**The payload is gated on the reply to the opcode.** The command is
+`int res = spi_uio_cmd_cont(UIO_SET_FBUF);` (`video.cpp:3480`) and then
+`if (res)` (`:3481`). The ten words above (`:3502-3511`) and the single `0` of
+the disable path (`:3527`) are both inside that `if`; a core that answers `0`
+gets "Core doesn't support HPS frame buffer" (`:3535`) and no payload at all.
+`DisableIO()` (`:3539`) runs either way. Reproduce that: send the opcode, read
+the reply, and send the payload only when it is non-zero. A core that answers
+`0` has no HPS frame buffer to switch to, so `fb enable` reports that instead
+of pushing ten words at a core that is not listening. `UIO_SET_VIDEO` has no
+such gate (§2).
 
 Then write `8888 1 <width> <height> <width*4>` to
 `/sys/module/MiSTer_fb/parameters/mode` (`fb_write_module_params()`,

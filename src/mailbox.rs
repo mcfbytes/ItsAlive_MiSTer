@@ -264,7 +264,14 @@ impl<R: Regs, D: Deadline> Mailbox<R, D> {
     ///
     /// `fpga_io.cpp:696-705` and `:709-718`, which are the same loop twice.
     /// Bit 31 is tested first and on every read of both loops, because that
-    /// is what the C does.
+    /// is what the C does: `if (gpi < 0)` (`:699`, `:712`) is the body of the
+    /// `do`, so it runs before `while (!(gpi & SSPI_ACK))` (`:705`) or
+    /// `while (gpi & SSPI_ACK)` (`:718`) is ever evaluated. The order is not
+    /// cosmetic — an unconfigured fabric can present bit 31 and the ack bit
+    /// in the same read, and that read must abort, not complete a transfer.
+    ///
+    /// The deadline check is last for the same reason: it must not be able to
+    /// turn a [`Error::NoBitstream`] into a [`Error::Timeout`].
     fn wait_ack(&mut self, want_set: bool) -> Result<u32> {
         self.deadline.start();
         loop {
@@ -294,24 +301,56 @@ impl<R: Regs, D: Deadline> Mailbox<R, D> {
     ///
     /// `spi_uio_cmd()` (`spi.cpp:112-117`) is `spi_uio_cmd_cont()`
     /// (`:106-110`) — `EnableIO()` plus one `spi_w(cmd)` — followed by
-    /// `DisableIO()`, and the multi-word senders such as `set_video()`
-    /// (`video.cpp:2266-2294`) put their payload `spi_w()`s in between. The
-    /// value returned is the reply to the *opcode* word, which is what
-    /// `spi_uio_cmd()` returns.
+    /// `DisableIO()`. `set_video()` is exactly that shape with its payload in
+    /// between: `spi_uio_cmd_cont(UIO_SET_VIDEO)` at `video.cpp:2266`, the 26
+    /// `spi_w()`s of `:2268-2291`, `DisableIO()` at `:2294`, and the reply to
+    /// the opcode word dropped on the floor. The value returned here is that
+    /// reply, which is what `spi_uio_cmd()` returns.
+    ///
+    /// **Not every sender has this shape.** `video_fb_enable()` sends its
+    /// payload only when the opcode's reply is non-zero
+    /// (`video.cpp:3480-3481`), so `UIO_SET_FBUF` goes through
+    /// [`command_if_supported`](Mailbox::command_if_supported) and never
+    /// through this method.
     ///
     /// The enable bit is dropped on every path out, including errors.
     pub fn command(&mut self, opcode: u16, payload: &[u16]) -> Result<u16> {
         self.enable_io();
-        let reply = self.burst(opcode, payload);
+        let reply = self.burst(opcode, payload, false);
+        self.disable_io();
+        reply
+    }
+
+    /// Send one user_io command whose payload the core first has to ask for.
+    ///
+    /// `video_fb_enable()` (`video.cpp:3474-3543`) opens with
+    /// `int res = spi_uio_cmd_cont(UIO_SET_FBUF);` (`:3480`) and then
+    /// `if (res)` (`:3481`). The ten payload words (`:3502-3511`) — and the
+    /// single `0` of the disable path (`:3527`) — sit *inside* that `if`: a
+    /// core that answers `0` is told "Core doesn't support HPS frame buffer"
+    /// (`:3535`) and receives no payload at all. `DisableIO()` (`:3539`) runs
+    /// either way, as it does here.
+    ///
+    /// Returns the opcode's reply, so the caller can tell the two cases
+    /// apart: non-zero means the payload went out. See
+    /// `docs/ARCHITECTURE.md` §5.
+    pub fn command_if_supported(&mut self, opcode: u16, payload: &[u16]) -> Result<u16> {
+        self.enable_io();
+        let reply = self.burst(opcode, payload, true);
         self.disable_io();
         reply
     }
 
     /// The words of a command, between `EnableIO()` and `DisableIO()`.
-    fn burst(&mut self, opcode: u16, payload: &[u16]) -> Result<u16> {
+    ///
+    /// When `gated`, the payload is sent only if the opcode's reply is
+    /// non-zero — the `if (res)` of `video.cpp:3481`.
+    fn burst(&mut self, opcode: u16, payload: &[u16], gated: bool) -> Result<u16> {
         let reply = self.spi_w(opcode)?;
-        for &word in payload {
-            self.spi_w(word)?;
+        if !gated || reply != 0 {
+            for &word in payload {
+                self.spi_w(word)?;
+            }
         }
         Ok(reply)
     }
@@ -321,6 +360,7 @@ impl<R: Regs, D: Deadline> Mailbox<R, D> {
 mod tests {
     use super::*;
     use std::cell::Cell;
+    use std::rc::Rc;
 
     /// The GPO word `enable_io()` writes from a zero shadow: bit 31 plus
     /// [`SSPI_IO_EN`].
@@ -375,11 +415,27 @@ mod tests {
         }
     }
 
+    /// Ceiling on `expired()` calls over the whole life of a
+    /// [`FakeDeadline`], whatever its budget says. No honest test here polls
+    /// more than a handful of times, so this never fires on working code; it
+    /// exists so that a defect which lets a poll run away — a window reopened
+    /// per read, a check evaluated in the wrong order — fails a read-count
+    /// assertion in milliseconds instead of hanging CI.
+    const FUSE: u32 = 10_000;
+
     /// A [`Deadline`] that expires after a fixed number of polls, so a
-    /// timeout costs no wall-clock time. A budget of 0 expires immediately.
+    /// timeout costs no wall-clock time. A budget of 0 expires immediately;
+    /// a budget of *n* lets the poll loop run *n* further times, so a
+    /// never-acking fake is read *n* + 1 times before it gives up.
+    ///
+    /// `starts` counts the windows opened, and is shared with the test so it
+    /// can assert that [`Mailbox::wait_ack`] opens exactly one per poll loop
+    /// rather than one per GPI read.
     struct FakeDeadline {
         budget: u32,
         left: Cell<u32>,
+        starts: Rc<Cell<u32>>,
+        polls: Cell<u32>,
     }
 
     impl FakeDeadline {
@@ -387,21 +443,34 @@ mod tests {
             Self {
                 budget,
                 left: Cell::new(budget),
+                starts: Rc::new(Cell::new(0)),
+                polls: Cell::new(0),
             }
         }
 
-        /// Never expires within a test.
+        /// Never expires within a test — up to [`FUSE`] polls.
         fn patient() -> Self {
             Self::new(u32::MAX)
+        }
+
+        /// A handle on the window count, still readable after [`Mailbox`] has
+        /// taken ownership of the deadline.
+        fn starts(&self) -> Rc<Cell<u32>> {
+            Rc::clone(&self.starts)
         }
     }
 
     impl Deadline for FakeDeadline {
         fn start(&mut self) {
+            self.starts.set(self.starts.get() + 1);
             self.left.set(self.budget);
         }
 
         fn expired(&self) -> bool {
+            self.polls.set(self.polls.get() + 1);
+            if self.polls.get() > FUSE {
+                return true;
+            }
             let left = self.left.get();
             if left == 0 {
                 return true;
@@ -470,6 +539,37 @@ mod tests {
     }
 
     #[test]
+    fn a_new_word_clears_all_sixteen_data_bits_not_just_the_low_ones() {
+        // fpga_io.cpp:690 masks with ~(0xFFFF | SSPI_STROBE): the whole
+        // 16-bit data field goes before the next word is ORed in. This pair
+        // is the one that proves the width, because the second word does not
+        // cover the first — 0x0500 is 720p's hact and 0x02D0 its vact
+        // (video.cpp:127). A mask a byte narrower would leave bit 10 set and
+        // put 0x07D0, vact 2000, on the wire: a black screen with nothing to
+        // see from the host side.
+        let mut mb = mailbox(FakeRegs::acking(3, 0), FakeDeadline::patient());
+        mb.command(UIO_SET_VIDEO, &[0x0500, 0x02D0])
+            .expect("command");
+
+        assert_eq!(
+            mb.regs().writes,
+            vec![
+                0x8010_0000,
+                0x8010_0020,
+                0x8012_0020,
+                0x8010_0020,
+                0x8010_0500,
+                0x8012_0500,
+                0x8010_0500,
+                0x8010_02D0,
+                0x8012_02D0,
+                0x8010_02D0,
+                0x8000_02D0,
+            ]
+        );
+    }
+
+    #[test]
     fn reply_is_the_low_16_bits_of_the_final_gpi_read() {
         // The opcode's transfer ends on a read with the ack clear, and only
         // its low 16 bits are the reply (fpga_io.cpp:720). Bits 16..=30 of
@@ -524,8 +624,12 @@ mod tests {
 
     #[test]
     fn bit31_on_the_second_poll_is_no_bitstream_too() {
-        // The ack rises, then the fabric drops out. Bit 31 is tested before
-        // the ack bit, so a read with both set still aborts.
+        // The ack rises, then the fabric drops out while still asserting the
+        // ack: the second loop (fpga_io.cpp:709-718) tests bit 31 too, so it
+        // aborts rather than waiting for an ack that will never fall. The
+        // precedence of the two tests is pinned by the two tests below, not
+        // by this one — here the ack is set and the loop wants it clear, so
+        // the ack branch would miss in either order.
         let regs = FakeRegs::new(&[SSPI_ACK, GPI_NOT_READY | SSPI_ACK], 0);
         let mut mb = mailbox(regs, FakeDeadline::patient());
         let err = mb
@@ -548,15 +652,60 @@ mod tests {
     }
 
     #[test]
+    fn an_all_ones_gpi_aborts_although_the_ack_bit_is_set() {
+        // What a fabric with no bitstream actually presents is every GPI bit
+        // driven, so bit 31 and the ack bit (17) arrive in the *same* read.
+        // fpga_io.cpp:698-705 reads, tests `if (gpi < 0)` and only then
+        // evaluates `while (!(gpi & SSPI_ACK))`, so the abort wins and the C
+        // never mistakes that read for an ack. Testing the ack first instead
+        // would take this read as a successful rise and carry on into a
+        // transfer the fabric is not party to.
+        let mut mb = mailbox(FakeRegs::new(&[0xFFFF_FFFF], 0), FakeDeadline::patient());
+        let err = mb
+            .command(UIO_SET_VIDEO, &[0x1234])
+            .expect_err("no bitstream");
+
+        assert!(matches!(err, Error::NoBitstream), "got {err:?}");
+        assert_eq!(err.exit_code(), 10);
+        assert_eq!(mb.regs().reads(), 1);
+        assert_bus_released(&mb.regs().writes);
+    }
+
+    #[test]
+    fn bit31_beats_an_already_clear_ack_in_the_fall_poll() {
+        // The mirror image, for the second loop: the ack rises, then the
+        // fabric drops out with the ack already clear, so `gpi < 0` and
+        // `!(gpi & SSPI_ACK)` are both true in one read. fpga_io.cpp:711-718
+        // tests bit 31 first, so this is an abort — not a transfer that
+        // completes and hands the caller a reply of 0 from a dead fabric.
+        let regs = FakeRegs::new(&[SSPI_ACK, GPI_NOT_READY], 0);
+        let mut mb = mailbox(regs, FakeDeadline::patient());
+        let err = mb
+            .command(UIO_SET_VIDEO, &[0x1234])
+            .expect_err("no bitstream");
+
+        assert!(matches!(err, Error::NoBitstream), "got {err:?}");
+        assert_eq!(mb.regs().reads(), 2);
+        assert_bus_released(&mb.regs().writes);
+    }
+
+    #[test]
     fn a_fabric_that_never_acks_times_out_with_the_bus_released() {
-        // Deadline budget 0: expired on the first check, so the test is
-        // instant and the poll cannot spin.
-        let mut mb = mailbox(FakeRegs::new(&[], 0), FakeDeadline::new(0));
+        // A budget of 3 makes the rise poll really loop: three reads inside
+        // the window, one more after it closes. The counts are the point —
+        // they pin the window to one per poll loop (fpga_io.cpp:696-705 is
+        // one `do`), so a deadline restarted on every read, which no zero
+        // budget could tell apart, fails here instead of spinning forever on
+        // a fabric that has stopped acking.
+        let deadline = FakeDeadline::new(3);
+        let starts = deadline.starts();
+        let mut mb = mailbox(FakeRegs::new(&[], 0), deadline);
         let err = mb.command(UIO_SET_VIDEO, &[0x1234]).expect_err("timeout");
 
         assert!(matches!(err, Error::Timeout), "got {err:?}");
         assert_eq!(err.exit_code(), 11);
-        assert_eq!(mb.regs().reads(), 1);
+        assert_eq!(mb.regs().reads(), 4);
+        assert_eq!(starts.get(), 1, "one window per poll loop, not per read");
         assert_eq!(
             mb.regs().writes,
             vec![
@@ -572,13 +721,19 @@ mod tests {
 
     #[test]
     fn an_ack_that_never_clears_times_out_with_the_bus_released() {
-        // The second poll loop is bounded as well. The strobe was already
-        // lowered by fpga_io.cpp:707, so no extra write appears.
-        let mut mb = mailbox(FakeRegs::new(&[], SSPI_ACK), FakeDeadline::new(0));
+        // The second poll loop is bounded as well, and loops for real: the
+        // first read satisfies the rise, then a budget of 2 gives two more
+        // reads plus the one after the window closes. Two windows, one per
+        // `do` (fpga_io.cpp:696-705 and :709-718). The strobe was already
+        // lowered by :707, so no extra write appears on this error path.
+        let deadline = FakeDeadline::new(2);
+        let starts = deadline.starts();
+        let mut mb = mailbox(FakeRegs::new(&[], SSPI_ACK), deadline);
         let err = mb.command(UIO_SET_VIDEO, &[]).expect_err("timeout");
 
         assert!(matches!(err, Error::Timeout), "got {err:?}");
-        assert_eq!(mb.regs().reads(), 2);
+        assert_eq!(mb.regs().reads(), 4);
+        assert_eq!(starts.get(), 2, "one window per poll loop, not per read");
         assert_eq!(
             mb.regs().writes,
             vec![
@@ -634,6 +789,72 @@ mod tests {
             mb.regs().writes[before + 1..],
             [0x8010_0025, 0x8012_0025, 0x8010_0025, 0x8000_0025]
         );
+    }
+
+    #[test]
+    fn a_gated_command_sends_its_payload_when_the_core_answers() {
+        // video.cpp:3480-3481: `int res = spi_uio_cmd_cont(UIO_SET_FBUF);
+        // if (res)`. A non-zero reply means the core has the HPS frame
+        // buffer, and the payload words of :3502-3511 go out.
+        let mut mb = mailbox(FakeRegs::acking(3, 0x0001), FakeDeadline::patient());
+        let reply = mb
+            .command_if_supported(UIO_SET_FBUF, &[0x8016, 0x1000])
+            .expect("command");
+
+        assert_eq!(reply, 0x0001);
+        assert_eq!(
+            mb.regs().writes,
+            vec![
+                0x8010_0000,
+                0x8010_002F,
+                0x8012_002F,
+                0x8010_002F,
+                0x8010_8016,
+                0x8012_8016,
+                0x8010_8016,
+                0x8010_1000,
+                0x8012_1000,
+                0x8010_1000,
+                0x8000_1000,
+            ]
+        );
+    }
+
+    #[test]
+    fn a_gated_command_sends_no_payload_when_the_core_answers_zero() {
+        // The `else` of video.cpp:3533-3537: "Core doesn't support HPS frame
+        // buffer", no `spi_w()` at all, and `DisableIO()` at :3539 all the
+        // same. The reply reaches the caller so it can say which happened.
+        let mut mb = mailbox(FakeRegs::acking(1, 0), FakeDeadline::patient());
+        let reply = mb
+            .command_if_supported(UIO_SET_FBUF, &[0x8016, 0x1000])
+            .expect("command");
+
+        assert_eq!(reply, 0);
+        assert_eq!(mb.regs().reads(), 2);
+        assert_eq!(
+            mb.regs().writes,
+            vec![
+                0x8010_0000,
+                0x8010_002F,
+                0x8012_002F,
+                0x8010_002F,
+                0x8000_002F
+            ]
+        );
+        assert_bus_released(&mb.regs().writes);
+    }
+
+    #[test]
+    fn an_ungated_command_sends_its_payload_whatever_the_reply_is() {
+        // set_video() discards the reply to its opcode (video.cpp:2266) and
+        // sends all 26 words regardless, so `command` must not inherit the
+        // gate that `command_if_supported` implements.
+        let mut mb = mailbox(FakeRegs::acking(2, 0), FakeDeadline::patient());
+        let reply = mb.command(UIO_SET_VIDEO, &[0x1234]).expect("command");
+
+        assert_eq!(reply, 0);
+        assert!(mb.regs().writes.contains(&0x8012_1234), "payload not sent");
     }
 
     #[test]
