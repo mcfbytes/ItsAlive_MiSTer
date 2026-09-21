@@ -25,16 +25,36 @@ HDMI output on the HPS having programmed that PLL. So:
   Linux starts), so the daemon is the only missing piece, and it is a
   replaceable one.
 
-The three sequences, in the order they must run:
+The four sequences, in the order they must run:
 
 | # | What | Channel | Source in Main_MiSTer |
 |---|------|---------|-----------------------|
 | 1 | ADV7513 bulk configuration (92 register writes: 51 + 13 audio + 28 CSC) | I2C, chip address `0x39` | `video.cpp:1462-1615` `hdmi_config_init()`, then `hdmi_config_audio()`, `hdmi_config_set_csc()` (`:1180`) |
 | 2 | Video PLL block + timings (UIO_SET_VIDEO, 26 words), then the ADV7513's three mode registers | fabric mailbox, then I2C | `video.cpp:2266-2290` `set_video()`, `video.cpp:262-318` `setPLL()`, `video.cpp:1691-1727` `hdmi_config_set_mode()` |
-| 3 | Frame reader enable (UIO_SET_FBUF, 10 words) + kernel mode knob | fabric mailbox + sysfs | `video.cpp:3474-3530` `video_fb_enable()`, `video.cpp:3459-3471` `fb_write_module_params()` |
+| 3 | **Commit the mode** (UIO_BUT_SW, one payload word) | fabric mailbox | `user_io.cpp:3047-3101` `user_io_send_buttons(1)`, called one line after every `video_set_mode()` (`video.cpp:2732`, `:4331`) |
+| 4 | Frame reader enable (UIO_SET_FBUF, 10 words) + kernel mode knob | fabric mailbox + sysfs | `video.cpp:3474-3530` `video_fb_enable()`, `video.cpp:3459-3471` `fb_write_module_params()` |
 
-After 1 and 2 the screen shows **the core's own output** (the menu core draws a
-fabric-generated pattern with no HPS help). After 3 the screen shows
+**Step 3 is not optional and it is not a button-press emulation.** Steps 1 and
+2 only *describe* a mode; step 3 is what applies it. The framework clears its
+`cfg_set` flag on every `UIO_SET_VIDEO` payload word and raises it again only
+on `UIO_BUT_SW`, and it is the rising edge of that flag which (a) writes the
+PLL reconfiguration block's start register, so the staged PLL actually takes
+effect, and (b) enables the scaler's output. Without it the scaler drives no
+sync at all, which a monitor reports as **NO SIGNAL** rather than as a black
+picture — and the host side looks perfectly healthy throughout, every word
+acked. Main never programs a mode without it.
+
+The payload is the `MiSTer.ini` switch bitmap that `user_io_send_buttons()`
+assembles (`user_io.cpp:3055-3070`). At the defaults `cfg_parse()` installs
+(`cfg.cpp:594-612`) exactly one bit is set, `CONF_CSYNC` (`user_io.h:144`),
+because `cfg.csync = 1` (`cfg.cpp:595`) and every other flag is either memset
+to zero or, in `cfg.dvi_mode`'s case, 2 against a test for 1
+(`user_io.cpp:3064`). So we send `0x0008`. The bit itself only routes
+composite sync on the analog VGA path, so HDMI is indifferent to its value;
+we match stock because that is cheaper than justifying a difference.
+
+After 1 to 3 the screen shows **the core's own output** (the menu core draws a
+fabric-generated pattern with no HPS help). After 4 the screen shows
 `/dev/fb0`, and because our kernel has `CONFIG_FRAMEBUFFER_CONSOLE=y`, text
 written to `/dev/tty1` is painted by fbcon. That is the same mechanism stock
 MiSTer uses to show `update_all` on screen.
@@ -92,9 +112,22 @@ Opcodes used (`user_io.h`):
 
 | Opcode | Value | Line |
 |--------|-------|------|
+| `UIO_BUT_SW` | `0x01` | `:13` (the mode commit, §1 step 3) |
 | `UIO_SET_VIDEO` | `0x20` | `:42` |
 | `UIO_LEDS` | `0x25` | `:47` (optional `leds` subcommand only) |
 | `UIO_SET_FBUF` | `0x2F` | `:57` |
+
+**GPO must be zeroed before the first transfer.** `fpga_io_init()`
+(`fpga_io.cpp:532-539`) is the `mmap` followed by `fpga_gpo_write(0)` and
+nothing else, and it runs before any mailbox traffic. This is not bookkeeping:
+the framework releases a latched core reset only on a *two-sample* combination
+of `GPO[31:30]` — `2'b00` and then `2'b10` — deliberately, so that one stray
+write cannot drive the reset line. Every `EnableIO()` already asserts bit 31
+(`fpga_io.cpp:668-672`), so without a preceding zero the fabric never sees the
+`2'b00` sample and a reset found latched can never be cleared. The ack FSM is
+not gated by that reset, so the failure looks exactly like a healthy mailbox
+attached to a dark screen. Asserting reset needs `2'b01`, i.e. bit 30, which
+this tool never sets (`fpga_io.cpp:649-652` is the C's only writer of it).
 
 Access is `mmap` of `/dev/mem` at the FPGA manager page (`O_SYNC`, one 4 KiB
 page). Our kernel has `CONFIG_DEVMEM=y` and no `STRICT_DEVMEM`.

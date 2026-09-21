@@ -94,6 +94,31 @@ pub const SSPI_OSD_EN: u32 = 1 << 19;
 /// `spi.cpp:7` — `SSPI_IO_EN (1<<20)`.
 pub const SSPI_IO_EN: u32 = 1 << 20;
 
+/// Buttons and switches, and the word that *commits* a video mode.
+///
+/// `user_io.h:13` — `UIO_BUT_SW 0x01`. The name is a historical accident: the
+/// payload is a bitmap of front-panel buttons and `MiSTer.ini` switches, but
+/// the framework treats the arrival of the command itself as the signal that
+/// the host has finished describing a mode. It is not optional and it is not a
+/// button-press emulation; see [`CONF_CSYNC`] for the payload and
+/// `docs/ARCHITECTURE.md` §2 for why every mode change ends with it.
+pub const UIO_BUT_SW: u16 = 0x01;
+
+/// The `UIO_BUT_SW` payload at Main_MiSTer's no-`MiSTer.ini` defaults.
+///
+/// `user_io.h:144` — `CONF_CSYNC 0b0000000000001000`. `user_io_send_buttons()`
+/// (`user_io.cpp:3047-3101`) ORs one bit per enabled option; at the defaults
+/// `cfg_parse()` installs (`cfg.cpp:594-612`) the only one set is
+/// `cfg.csync = 1` (`cfg.cpp:595`), because `cfg.dvi_mode` is 2 and the test
+/// at `user_io.cpp:3064` is `== 1`, and every other flag is memset to zero. No
+/// button is held, so `BUTTON1`/`BUTTON2` are clear too.
+///
+/// The bit itself only routes composite sync on the analog VGA path
+/// (`sys_top.v`'s `csync_en`), so HDMI is indifferent to its value — but this
+/// is what stock puts on the wire, and matching stock is cheaper than
+/// explaining why we did not.
+pub const CONF_CSYNC: u16 = 0b0000_0000_0000_1000;
+
 /// Set the video mode and PLL block. `user_io.h:42` — `UIO_SET_VIDEO 0x20`.
 pub const UIO_SET_VIDEO: u16 = 0x20;
 
@@ -189,8 +214,30 @@ pub struct Mailbox<R: Regs, D> {
 }
 
 impl<R: Regs, D: Deadline> Mailbox<R, D> {
-    /// A mailbox with a zeroed shadow.
-    pub fn new(regs: R, deadline: D) -> Self {
+    /// Take the mailbox, zeroing GPO before anything else touches it.
+    ///
+    /// The zero write is not bookkeeping — it is half of a handshake, and
+    /// leaving it out can wedge the fabric in reset with no symptom on the
+    /// host side.
+    ///
+    /// `fpga_io_init()` (`fpga_io.cpp:532-539`) is `shmem_map(...)` followed by
+    /// `fpga_gpo_write(0)` and nothing else, and `main.cpp` calls it before any
+    /// mailbox traffic. The framework releases the core from reset only on a
+    /// *two-sample* combination of `GPO[31:30]` — `2'b00` and then `2'b10` —
+    /// deliberately, so that a single stray write cannot drive the reset line.
+    /// Our first transfer already asserts bit 31 (every [`Self::enable_io`] ORs
+    /// it in, `fpga_io.cpp:668-672`), so without a preceding zero the fabric
+    /// never sees the `2'b00` sample and a latched reset can never be cleared.
+    ///
+    /// This cannot *assert* reset: that needs `GPO[31:30] == 2'b01`, i.e. bit
+    /// 30, which nothing in this crate ever sets (`fpga_io.cpp:649-652` is the
+    /// only writer of bit 30 in the C).
+    ///
+    /// The shadow stays 0 afterwards, so shadow and register agree from the
+    /// first instant rather than from the first transfer.
+    pub fn new(mut regs: R, deadline: D) -> Self {
+        // fpga_io.cpp:537.
+        regs.gpo_write(0);
         Self {
             regs,
             deadline,
@@ -201,6 +248,14 @@ impl<R: Regs, D: Deadline> Mailbox<R, D> {
     /// The registers, for callers that need to look at them.
     pub fn regs(&self) -> &R {
         &self.regs
+    }
+
+    /// The registers, mutably. Tests use this to reset a recording fake; the
+    /// tool itself must drive the registers through the mailbox, never around
+    /// it, so this is deliberately not part of the public surface.
+    #[cfg(test)]
+    fn regs_mut(&mut self) -> &mut R {
+        &mut self.regs
     }
 
     /// The current GPO shadow, for logging.
@@ -492,8 +547,37 @@ mod tests {
         }
     }
 
+    /// A mailbox whose constructor traffic has been checked and consumed.
+    ///
+    /// [`Mailbox::new`] stores GPO = 0 first (`fpga_io.cpp:537`), the `2'b00`
+    /// sample the framework's reset release needs. Asserting it here means
+    /// **every** test below re-checks it, and the tests can then describe only
+    /// the traffic their own call produced.
+    /// `new_zeroes_gpo_before_any_transfer` pins it on its own as well.
     fn mailbox(regs: FakeRegs, deadline: FakeDeadline) -> Mailbox<FakeRegs, FakeDeadline> {
-        Mailbox::new(regs, deadline)
+        let mut mb = Mailbox::new(regs, deadline);
+        assert_eq!(
+            mb.regs().writes,
+            vec![0],
+            "the constructor must zero GPO before anything else"
+        );
+        mb.regs_mut().writes.clear();
+        mb
+    }
+
+    #[test]
+    fn new_zeroes_gpo_before_any_transfer() {
+        // fpga_io.cpp:532-539: fpga_io_init() maps the page and writes 0, and
+        // nothing touches the mailbox before it. The framework clears a
+        // latched core reset only on GPO[31:30] sampled 2'b00 then 2'b10, and
+        // every enable_io() asserts bit 31, so without this store the 2'b00
+        // sample never happens.
+        let mb = Mailbox::new(FakeRegs::acking(2, 0), FakeDeadline::patient());
+        assert_eq!(mb.regs().writes, vec![0x0000_0000]);
+        // Bit 30 is the *assert*-reset half of the pair (fpga_io.cpp:649-652)
+        // and nothing in this crate may ever set it.
+        assert_eq!(mb.regs().writes[0] & (1 << 30), 0);
+        assert_eq!(mb.shadow(), 0, "shadow and register agree from the start");
     }
 
     /// Every error exit must leave the bus idle: enable dropped, strobe low,

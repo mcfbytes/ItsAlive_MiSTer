@@ -404,6 +404,23 @@ where
     hw::log(format_args!(
         "itsalive: adv7513: 3 mode registers written, {refused} refused"
     ));
+
+    // Step 3: commit. Without this the fabric has been *told* the mode and has
+    // applied none of it: `UIO_SET_VIDEO` clears the framework's `cfg_set` on
+    // each of its own payload words, and only `UIO_BUT_SW` raises it again,
+    // which is what starts the staged PLL reconfiguration and what enables the
+    // scaler's output. A monitor reports the difference as NO SIGNAL, not as a
+    // black picture. Main never programs a mode without it: every
+    // `video_set_mode()` is followed one line later by a forced
+    // `user_io_send_buttons(1)` (`video.cpp:2732`, `:4331`), which ends in
+    // `spi_uio_cmd16(UIO_BUT_SW, map)` (`user_io.cpp:3100`) — one opcode word
+    // and one payload word, exactly this call. See ARCHITECTURE §2.
+    mb.command(mailbox::UIO_BUT_SW, &[mailbox::CONF_CSYNC])?;
+    hw::log(format_args!(
+        "itsalive: video: committed ({:#06X} = {:#06X})",
+        mailbox::UIO_BUT_SW,
+        mailbox::CONF_CSYNC
+    ));
     Ok(())
 }
 
@@ -1113,6 +1130,19 @@ mod tests {
                 .map(|(reg, value)| Event::I2c(reg, value)),
         );
 
+        // 3. The commit word. Everything above only *stages* a mode: the
+        //    framework clears `cfg_set` on each UIO_SET_VIDEO payload word and
+        //    only UIO_BUT_SW raises it again, which starts the PLL
+        //    reconfiguration and enables the scaler's output. Main pairs the
+        //    two one line apart at `video.cpp:2732` and `:4331`
+        //    (`user_io_send_buttons(1)` -> `spi_uio_cmd16(UIO_BUT_SW, map)`,
+        //    `user_io.cpp:3100`). Literal 0x01/0x0008 rather than the
+        //    constants, so renaming or re-valuing either one fails here.
+        expected.push(Event::EnableIo);
+        expected.push(Event::Word(0x0001));
+        expected.push(Event::Word(0x0008));
+        expected.push(Event::DisableIo);
+
         expected
     }
 
@@ -1184,6 +1214,13 @@ mod tests {
             [(0x17u8, 0x62u8), (0x3B, 0x40), (0x3C, 0x01)]
                 .map(|(reg, value)| Event::I2c(reg, value)),
         );
+
+        // The commit word, identical for both modes: the payload is the
+        // `MiSTer.ini` switch bitmap, not anything mode-dependent (§2).
+        expected.push(Event::EnableIo);
+        expected.push(Event::Word(0x0001));
+        expected.push(Event::Word(0x0008));
+        expected.push(Event::DisableIo);
 
         // UIO_SET_FBUF: format word, `FB_ADDR + 4096` in two halves, then the
         // 640x480 geometry and a 2560-byte stride (§5).
@@ -1269,9 +1306,13 @@ mod tests {
             .collect();
         assert_eq!(words.first().copied(), Some(0x20), "UIO_SET_VIDEO");
         assert_eq!(words.get(1).copied(), Some(1280), "hact, word 1");
-        assert_eq!(words.len(), 1 + 26 + 1 + 10);
-        assert_eq!(words.get(27).copied(), Some(0x2F), "UIO_SET_FBUF");
-        assert_eq!(words.get(28).copied(), Some(0x8016), "FB_EN | RxB | 8888");
+        assert_eq!(words.len(), 1 + 26 + 2 + 1 + 10);
+        // The commit word sits between the mode registers and SET_FBUF: the
+        // mode has to be applied before the frame reader is pointed at it.
+        assert_eq!(words.get(27).copied(), Some(0x01), "UIO_BUT_SW");
+        assert_eq!(words.get(28).copied(), Some(0x0008), "CONF_CSYNC");
+        assert_eq!(words.get(29).copied(), Some(0x2F), "UIO_SET_FBUF");
+        assert_eq!(words.get(30).copied(), Some(0x8016), "FB_EN | RxB | 8888");
 
         // And the last event of all is the sysfs line, not the first.
         assert_eq!(
