@@ -47,6 +47,42 @@ Listed with the expected answer and what changes if it is wrong.
    drives `LED_POWER[1]=1` with a PWM sawtooth on `[0]` while `FB` is off).
    Not needed by this tool, but worth one glance during phase 3 because it
    answers Buildroot_MiSTer ADR 0020 §7's open question for free.
+6. **Is the core actually found in reset, so that the GPO-zero store
+   matters?** `Mailbox::new` writes GPO = 0 because releasing a latched
+   core reset needs `GPO[31:30]` sampled `2'b00` then `2'b10` (ARCHITECTURE
+   §2). Whether the reset *is* latched after a U-Boot configuration cannot
+   be settled by reading: if the FPGA manager's GPO happens to read 0 at HPS
+   boot, our first write would have performed the transition by luck. The
+   store is correct either way and costs one word. If the screen is dark,
+   this is not the thing to suspect first — but it is worth confirming the
+   store is on the wire before suspecting anything else.
+7. **Does `0x94 = 0x00` cost anything visible?** ARCHITECTURE §4 records it
+   as our one deliberate byte divergence from stock in the 92. Nothing here
+   reads the ADV7513 INT pin, so expect no difference; verify rather than
+   assume, and if a sink refuses to lock, try `0xC0` before suspecting the
+   tables.
+8. **Does the sink lock without the SPD InfoFrame?** Stock's steady state
+   has `0x40` bit 6 set, through a read-modify-write on a path we do not
+   walk, so stock settles at `0x40 = 0x40` and we stay at `0x00`. The C
+   cannot settle whether it is *needed*: it puts a picture up as much as
+   500 ms before that write happens. Bring up with `0x00`; if the monitor
+   syncs and then drops, or refuses audio-capable sinks, that is the first
+   thing to try. Adding it properly means the whole faithful sequence
+   (read-modify-write on `0x39`, then the bracketed payload on the `0x38`
+   sub-map of the *already-pinned* bus), never a bare bit-set — enabling a
+   packet with no packet memory behind it is a state the C deliberately
+   refuses.
+9. **Before blaming this tool for a dark screen**, check the f2sdram
+   bridges are up: `devmem2 0xFFC25080` should read `0x00003FFF`. They are
+   raised by U-Boot's `bridge enable`, not by anything in userspace, and
+   without them the fabric cannot reach HPS DDR at `0x22000000` at all —
+   `hdmi` would still work and `fb enable` would scan nothing.
+
+A note on diagnosis, because three of these produce the same symptom: a
+missing §1 step 3, an unreleased core reset, and painting before the sysfs
+knob all give a black or NO-SIGNAL screen with every host-side signal green
+and every exit code 0. Settle them in that order — the commit word is on the
+wire and cheapest to confirm.
 
 ## 3. Rig protocol (phase 3)
 
@@ -62,7 +98,9 @@ core in the fabric:
    shows without Main. Note it.
 3. `itsalive probe --json` → log.
 4. `itsalive hdmi` → expect the menu core's own picture. Log dmesg, exit
-   code, the monitor's reported mode.
+   code, the monitor's reported mode. If the monitor says NO SIGNAL rather
+   than showing black, the commit word (§1 step 3) is the first suspect:
+   confirm `UIO_BUT_SW` went out after the three mode registers.
 5. `itsalive fb enable` then `itsalive say --clear "It's alive"` → expect
    text. Log the same.
 6. `itsalive hdmi --mode 480p` after `fb disable` → expect a picture again.
