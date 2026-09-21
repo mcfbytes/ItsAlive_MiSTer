@@ -29,7 +29,7 @@ The three sequences, in the order they must run:
 
 | # | What | Channel | Source in Main_MiSTer |
 |---|------|---------|-----------------------|
-| 1 | ADV7513 bulk configuration (64 register writes) | I2C, chip address `0x39` | `video.cpp:1462-1615` `hdmi_config_init()`, then `hdmi_config_audio()`, `hdmi_config_set_csc()` (`:1180`) |
+| 1 | ADV7513 bulk configuration (92 register writes: 51 + 13 audio + 28 CSC) | I2C, chip address `0x39` | `video.cpp:1462-1615` `hdmi_config_init()`, then `hdmi_config_audio()`, `hdmi_config_set_csc()` (`:1180`) |
 | 2 | Video PLL block + timings (UIO_SET_VIDEO, 26 words), then the ADV7513's three mode registers | fabric mailbox, then I2C | `video.cpp:2266-2290` `set_video()`, `video.cpp:262-318` `setPLL()`, `video.cpp:1691-1727` `hdmi_config_set_mode()` |
 | 3 | Frame reader enable (UIO_SET_FBUF, 10 words) + kernel mode knob | fabric mailbox + sysfs | `video.cpp:3474-3530` `video_fb_enable()`, `video.cpp:3459-3471` `fb_write_module_params()` |
 
@@ -167,13 +167,24 @@ Default mode: **1280x720@60**, `Fpix = 74.25`, timings
   `video.cpp:1691-1727`), three writes:
   `0x17 = 0b00000010 | sync_invert` where `sync_invert = (1<<5)` when
   `hpol == 0` and `(1<<6)` when `vpol == 0`, so for our presets `0x17 = 0x62`;
-  `0x3B = 0b01000000` (manual pixel repetition, `pr == 0`, no direct video);
-  `0x3C = VIC` (4 for 720p, 1 for 480p).
+  `0x3B = 0b01000000` (manual pixel repetition) for a mode with `pr == 0`,
+  which both presets are, and `0b01001000` (2x clock) for one with `pr != 0`
+  (`video.cpp:1699`); the third arm, `0` for direct video in the menu, cannot
+  arise here because `cfg.direct_video` defaults to 0;
+  `0x3C = VIC` (4 for 720p, 1 for 480p). Main also caches the last three
+  values and skips the writes when none changed (`video.cpp:1706`); we set the
+  mode once per run, so we always write.
 - **Power.** `0x41 = 0x10` (power up) is inside the bulk table; `0x41 = 0x50`
   powers down. `hdmi --off` writes only that.
 - **Not done:** EDID read (`0x3F` map), SPD InfoFrame (`0x38`), CEC (`0x3C`
   map), HDR, interrupt arming. None is needed for a picture on a DVI or HDMI
-  monitor.
+  monitor. Interrupt arming is the one place this shows up as a byte on the
+  wire: `0x94` is the INT1 enable mask, and Main writes
+  `hdmi_has_int() ? 0xC0 : 0x00` there (`video.cpp:1465`, `:1568`), asking the
+  fabric whether the core routes the interrupt pin. We ask nothing and write
+  `0x94 = 0x00` unconditionally. That is the only byte of the 92 that differs
+  from Main on a core with the pin; if HPD ever gets serviced, this row and
+  the mailbox query have to land together.
 
 ## 5. UIO_SET_FBUF: 10 words, plus the kernel knob
 

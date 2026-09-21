@@ -13,6 +13,12 @@
 //! produced it. A reviewer should be able to re-derive every byte below from
 //! the cited `file:line` without guessing.
 //!
+//! Nobody has to take that on trust: `tests/golden/adv7513.cpp` is the same
+//! four C functions compiled against upstream's own `mat4x4.h`, and
+//! `tests/adv7513_golden.rs` asserts every one of the 92 pairs below, in
+//! order, against what that program prints. The unit tests in this file lock
+//! the shape of the tables; the golden test is what proves the bytes.
+//!
 //! The no-ini defaults this module depends on, all from `cfg.cpp`:
 //!
 //! | `cfg` field | Default | Source |
@@ -229,18 +235,29 @@ pub const POWER_DOWN: (u8, u8) = (0x41, 0x50);
 /// `pr_flags` for "manual pixel repetition", `video.cpp:1700`.
 ///
 /// `hdmi_config_set_mode()` picks between three values (`video.cpp:1698-1700`):
-/// `0` when `cfg.direct_video && is_menu()`, `0b01001000` when the mode's `pr`
-/// field is non-zero, and `0b01000000` otherwise. `cfg.direct_video` defaults
-/// to 0 (`cfg.cpp:594`) and both modes we support have `pr == 0`
-/// (`vmodes[0]` at `video.cpp:127` and `vmodes[6]` at `video.cpp:133`), so the
-/// third branch is the one that applies and the byte is constant for us.
+/// `0` when `cfg.direct_video && is_menu()`, [`PR_FLAGS_MANUAL_2X`] when the
+/// mode's `pr` field is non-zero, and this one otherwise. `cfg.direct_video`
+/// defaults to 0 (`cfg.cpp:594`) and we never program the menu core's direct
+/// video path, so the first branch cannot be reached here; the other two are
+/// both live and the caller's `pr` chooses between them.
 const PR_FLAGS_MANUAL: u8 = 0b0100_0000;
 
-/// The three registers `hdmi_config_set_mode()` writes after `UIO_SET_VIDEO`,
-/// `video.cpp:1691-1727`.
+/// `pr_flags` for "manual pixel repetition with 2x clock", `video.cpp:1699`.
 ///
-/// `hpol` and `vpol` are the mode's sync polarities and `vic` its CEA VIC.
-/// Both preset modes leave `hpol` and `vpol` at their zero initialisation
+/// Both modes this crate ships have `pr == 0` (`vmodes[0]` at `video.cpp:127`
+/// and `vmodes[6]` at `video.cpp:133`), so nothing selects this value today.
+/// It exists so that [`mode_regs`] is total over the `pr` field a `Modeline`
+/// carries: `vmodes[14]` (`video.cpp:141`) is a `pr == 1` mode, and sending
+/// `0x3B = 0x40` for one would tell the chip 1x repetition on a 2x-clock
+/// mode — wrong TMDS timing, and a blank screen with nothing else to see.
+const PR_FLAGS_MANUAL_2X: u8 = 0b0100_1000;
+
+/// The three registers `hdmi_config_set_mode()` writes after `UIO_SET_VIDEO`,
+/// `video.cpp:1702-1712`.
+///
+/// `hpol` and `vpol` are the mode's sync polarities, `vic` its CEA VIC and
+/// `pr` its pixel-repetition flag. Both preset modes leave `hpol` and `vpol`
+/// at their zero initialisation
 /// (`docs/ARCHITECTURE.md` §3: `vmodes[]` rows carry no polarity, only custom
 /// modes set it), which is exactly why this write matters: the polarity the
 /// monitor sees comes from the `0x17` sync-invert bits, not from the wire.
@@ -250,10 +267,28 @@ const PR_FLAGS_MANUAL: u8 = 0b0100_0000;
 /// (`video.cpp:1702-1704`). Bit [1] is the 16:9 aspect-ratio flag and Main
 /// sets it unconditionally here.
 ///
+/// Main wraps those three writes in a cache we do not have: it keeps the last
+/// `sync_invert`, `pr_flags` and `vic_mode` in three file statics and returns
+/// before writing anything when all three are unchanged (`video.cpp:1706`,
+/// stored at `:1724-1726`, cleared by `hdmi_invalidate_mode_cache()` at
+/// `:1684-1689`). We drop it because we set the mode once per invocation and
+/// the three writes are idempotent, so there is no repeat to suppress.
+/// `tests/golden/adv7513.cpp` keeps the cache, and the golden test asserts a
+/// repeated call there writes nothing, so the difference stays on the record.
+///
 /// Takes scalars rather than a `&Modeline` only because `crate::video` is
-/// still a stub on this branch; see this module's tests for the expected
-/// values.
-pub fn mode_regs(hpol: u8, vpol: u8, vic: u8) -> [(u8, u8); 3] {
+/// still a stub on this branch; they are exactly the four
+/// `vmode_custom_param_t` fields the C reads, so the wrapper a later task adds
+/// cannot silently drop one. See this module's tests for the expected values.
+pub fn mode_regs(hpol: u8, vpol: u8, vic: u8, pr: u8) -> [(u8, u8); 3] {
+    // video.cpp:1698-1700. The `cfg.direct_video && is_menu()` arm is not
+    // reachable here; see PR_FLAGS_MANUAL.
+    let pr_flags = if pr != 0 {
+        PR_FLAGS_MANUAL_2X
+    } else {
+        PR_FLAGS_MANUAL
+    };
+
     // video.cpp:1702-1704
     let mut sync_invert: u8 = 0;
     if hpol == 0 {
@@ -265,7 +300,7 @@ pub fn mode_regs(hpol: u8, vpol: u8, vic: u8) -> [(u8, u8); 3] {
 
     [
         (0x17, 0b0000_0010 | sync_invert), // video.cpp:1710
-        (0x3B, PR_FLAGS_MANUAL),           // video.cpp:1711
+        (0x3B, pr_flags),                  // video.cpp:1711
         (0x3C, vic),                       // video.cpp:1712
     ]
 }
@@ -360,6 +395,24 @@ mod tests {
     }
 
     #[test]
+    fn init_arms_no_interrupts() {
+        // video.cpp:1568 writes `int0`, which is
+        // `hdmi_has_int() ? 0xC0 : 0x00` (video.cpp:1465): 0xC0 on a core that
+        // routes the ADV7513 interrupt pin, 0x00 on one that does not. We
+        // never make that query and never service HPD or monitor sense
+        // (docs/ARCHITECTURE.md section 4, "Not done"), so we write the
+        // no-interrupt mask unconditionally.
+        //
+        // This is the one byte in all 92 where we knowingly differ from Main.
+        // The assertion is here so that "fixing" it to 0xC0 has to be a
+        // deliberate change: arming INT1 without also servicing it, and
+        // without the mailbox query that decides whether the pin even exists,
+        // would leave the chip flagging interrupts nobody clears.
+        assert!(INIT.contains(&(0x94, 0x00)));
+        assert!(!INIT.contains(&(0x94, 0xC0)));
+    }
+
+    #[test]
     fn power_constants_match_tmds_power() {
         // video.cpp:2742: `uint8_t val = on ? 0x10 : 0x50;` on register 0x41.
         assert_eq!(POWER_UP, (0x41, 0x10));
@@ -382,13 +435,16 @@ mod tests {
         // vmodes[0], video.cpp:127: VIC 4, pr 0. hpol/vpol stay 0 for presets
         // (ARCHITECTURE §3), so both invert bits are set:
         // 0b00000010 | (1 << 5) | (1 << 6) == 0x62.
-        assert_eq!(mode_regs(0, 0, 4), [(0x17, 0x62), (0x3B, 0x40), (0x3C, 4)]);
+        assert_eq!(
+            mode_regs(0, 0, 4, 0),
+            [(0x17, 0x62), (0x3B, 0x40), (0x3C, 4)]
+        );
     }
 
     #[test]
     fn mode_regs_for_480p() {
         // vmodes[6], video.cpp:133: VIC 1, pr 0.
-        let regs = mode_regs(0, 0, 1);
+        let regs = mode_regs(0, 0, 1, 0);
         assert_eq!(regs[2], (0x3C, 1));
         // Only the VIC differs from 720p; 0x17 and 0x3B are polarity- and
         // pixel-repetition-driven, and neither changes between the presets.
@@ -399,20 +455,40 @@ mod tests {
     #[test]
     fn mode_regs_sync_invert_bits_follow_polarity() {
         // video.cpp:1702-1704, each branch exercised on its own.
-        assert_eq!(mode_regs(1, 1, 4)[0], (0x17, 0b0000_0010));
-        assert_eq!(mode_regs(0, 1, 4)[0], (0x17, 0b0010_0010));
-        assert_eq!(mode_regs(1, 0, 4)[0], (0x17, 0b0100_0010));
-        assert_eq!(mode_regs(0, 0, 4)[0], (0x17, 0b0110_0010));
+        assert_eq!(mode_regs(1, 1, 4, 0)[0], (0x17, 0b0000_0010));
+        assert_eq!(mode_regs(0, 1, 4, 0)[0], (0x17, 0b0010_0010));
+        assert_eq!(mode_regs(1, 0, 4, 0)[0], (0x17, 0b0100_0010));
+        assert_eq!(mode_regs(0, 0, 4, 0)[0], (0x17, 0b0110_0010));
     }
 
     #[test]
     fn mode_regs_pixel_repetition_is_the_manual_branch() {
         // video.cpp:1700: cfg.direct_video == 0 (cfg.cpp:594) and pr == 0 for
-        // both presets, so pr_flags is 0b01000000 and never 0 or 0b01001000.
+        // both presets, so pr_flags is 0b01000000 and never 0.
         assert_eq!(PR_FLAGS_MANUAL, 0b0100_0000);
         for vic in [1u8, 4u8] {
-            assert_eq!(mode_regs(0, 0, vic)[1], (0x3B, 0b0100_0000));
+            assert_eq!(mode_regs(0, 0, vic, 0)[1], (0x3B, 0b0100_0000));
         }
+    }
+
+    #[test]
+    fn mode_regs_takes_the_2x_clock_branch_for_a_pixel_repeat_mode() {
+        // video.cpp:1699: `else if (vm->param.pr != 0) pr_flags = 0b01001000`.
+        // No mode this crate ships sets pr, but vmodes[14] (video.cpp:141)
+        // does, and a wrapper over a Modeline must not be able to drop the
+        // field: 0x40 on a 2x-clock mode is wrong TMDS timing and a dark
+        // screen.
+        assert_eq!(PR_FLAGS_MANUAL_2X, 0b0100_1000);
+        assert_eq!(mode_regs(0, 0, 4, 1)[1], (0x3B, 0x48));
+
+        // pr changes nothing else in the triple.
+        let with_pr = mode_regs(0, 0, 4, 1);
+        let without = mode_regs(0, 0, 4, 0);
+        assert_eq!(with_pr[0], without[0]);
+        assert_eq!(with_pr[2], without[2]);
+
+        // Any non-zero pr takes it; the C tests `!= 0`, not `== 1`.
+        assert_eq!(mode_regs(0, 0, 4, 2)[1], (0x3B, 0x48));
     }
 
     #[test]
@@ -445,13 +521,13 @@ mod tests {
         // addresses across tables are intentional.
         assert!(INIT.contains(&(0x3B, 0x80)));
         assert!(INIT.contains(&(0x3C, 0x00)));
-        assert_eq!(mode_regs(0, 0, 4)[1], (0x3B, 0x40));
-        assert_eq!(mode_regs(0, 0, 4)[2], (0x3C, 0x04));
+        assert_eq!(mode_regs(0, 0, 4, 0)[1], (0x3B, 0x40));
+        assert_eq!(mode_regs(0, 0, 4, 0)[2], (0x3C, 0x04));
 
         // 0x17 carries the same 0x62 in both places (video.cpp:1533 and the
         // evaluated video.cpp:1710), so the mode write is idempotent for it.
         assert!(INIT.contains(&(0x17, 0x62)));
-        assert_eq!(mode_regs(0, 0, 4)[0], (0x17, 0x62));
+        assert_eq!(mode_regs(0, 0, 4, 0)[0], (0x17, 0x62));
     }
 
     #[test]
