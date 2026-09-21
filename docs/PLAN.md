@@ -12,7 +12,7 @@ hardware run as small and as diagnosable as possible.
 | 0 | Repo skeleton, CI, cross-build | `cargo test` on host, `cargo build` for both ARM targets in CI | this repo |
 | 1 | Pure core: mailbox framing, PLL solver, SET_VIDEO and SET_FBUF composers, ADV7513 tables | golden-vector tests derived from Main_MiSTer's arithmetic; recording-fake tests for the command bursts | this repo |
 | 2 | Hardware paths and CLI | builds, `probe` runs on the rig and reports sanely | this repo |
-| 3 | First light on the rig | `hdmi` gives the menu core's picture; `up` + `say` gives text on HDMI; results logged | rig + this repo's `docs/testlogs/` |
+| 3 | First light on the rig | `hdmi` gives the menu core's picture; `up` + `say` gives text on HDMI; `image` puts a picture on it with red where red belongs; results logged | rig + this repo's `docs/testlogs/` |
 | 4 | Buildroot package + installer integration | package builds in the installer config; QEMU installer test still passes with the tool absent and present-but-failing; card test on the rig shows the splash | Buildroot_MiSTer |
 | 5 | Hardening | direct-draw fallback if fbcon does not bind; `leds`; 480p verified; a second monitor | this repo |
 
@@ -72,7 +72,26 @@ Listed with the expected answer and what changes if it is wrong.
    sub-map of the *already-pinned* bus), never a bare bit-set — enabling a
    packet with no packet memory behind it is a state the C deliberately
    refuses.
-9. **Before blaming this tool for a dark screen**, check the f2sdram
+9. **Does fbcon fight `itsalive image` for the same pixels?** They write
+   the same `/dev/fb0`: `say` goes through the console and `image` writes it
+   directly (ARCHITECTURE §5). Expect the last writer to win, and expect
+   fbcon's cursor to repaint one character cell on a timer even with nothing
+   being written — `fbcon_cursor_blink` is on by default
+   (`fbcon.c:177`, `:416`). If a blinking block sits on the splash, turn it
+   off with `echo 0 > /sys/class/graphics/fbcon/cursor_blink`
+   (`fbcon.c:3261-3321`) and record whether that was enough, or whether the
+   console has to be given up altogether (`setterm -cursor off`,
+   `con2fbmap`). This is the question that decides whether the installer can
+   mix `say` and `image` or has to choose one.
+10. **Does `write(2)` to `/dev/fb0` reach the fabric's frame reader?** It
+   should: `.fb_write = fb_sys_write` (`MiSTer_fb.c:137`) copies into
+   `screen_base`, which is a `memremap(..., MEMREMAP_WT)` write-through
+   mapping of the reserved DDR the frame reader scans (`MiSTer_fb.c:261`), so
+   there is nothing to flush. If a written image does not appear but `say`
+   does, the difference is the offset: fbcon starts at `screen_base` too, so
+   suspect the geometry read-back before suspecting the write.
+
+11. **Before blaming this tool for a dark screen**, check the f2sdram
    bridges are up: `devmem2 0xFFC25080` should read `0x00003FFF`. They are
    raised by U-Boot's `bridge enable`, not by anything in userspace, and
    without them the fabric cannot reach HPS DDR at `0x22000000` at all —
@@ -103,12 +122,39 @@ core in the fabric:
    confirm `UIO_BUT_SW` went out after the three mode registers.
 5. `itsalive fb enable` then `itsalive say --clear "It's alive"` → expect
    text. Log the same.
-6. `itsalive hdmi --mode 480p` after `fb disable` → expect a picture again.
-7. Restart Main (or reboot). Confirm Main comes up normally after the tool
+6. `itsalive image` — the new subcommand, in four steps, because each one
+   fails differently:
+   a. `cat /sys/module/MiSTer_fb/parameters/mode` → expect
+      `8888 1 1280 720 5120`. This is the read-back the command itself does,
+      and it is also the first evidence anywhere that the mode write of §5
+      actually took: `mode_set` returns 0 even when the driver never probed.
+      If it is empty, stop — nothing below can work and `image` will say so.
+   b. On the build host, make a test image whose four corners are different
+      colours and whose left half is **red**, then copy it over:
+      `ffmpeg -i test.png -vf scale=1280:720 -f rawvideo -pix_fmt bgra test.raw`.
+      Red on the left is the whole point: if the screen shows blue there, the
+      byte order is wrong and ARCHITECTURE §5's `rb` reasoning is wrong with
+      it. A greyscale or monochrome test image proves nothing.
+   c. `itsalive image test.raw` → expect the picture, full screen. Then
+      `itsalive image --size 320x200 --clear small.raw` → expect it centred
+      with black around it. Check the edges: a sheared or diagonally
+      displaced picture means the stride, a picture offset by a constant
+      means the centring.
+   d. `itsalive say hello` afterwards → expect text over the picture, and
+      watch for a blinking cursor block (§2 unknown 9). Log what it does to
+      the image; that answer decides what the installer is allowed to call.
+   Also run `itsalive image` *before* `fb enable` on a fresh boot once, and
+   log that it exits 2 and says to run `fb enable` first.
+7. `itsalive hdmi --mode 480p` after `fb disable` → expect a picture again.
+8. Restart Main (or reboot). Confirm Main comes up normally after the tool
    touched the fabric; log it.
-8. Write `docs/testlogs/YYYY-MM-DD-rig-first-light.md` with the
+9. Write `docs/testlogs/YYYY-MM-DD-rig-first-light.md` with the
    `probe --json` output, every exit code, and photos or a description of
    what the monitor showed at each step.
+
+The `mode` read-back in step 6a is worth running at every earlier step too: it
+costs nothing, and it is the one line that separates "the knob was written" from
+"the driver took it".
 
 If step 4 shows nothing: try the ADV7513 mode registers (`0x17/0x3B/0x3C`),
 then the 480p mode, then compare against a `strace -e ioctl` of stock Main's
