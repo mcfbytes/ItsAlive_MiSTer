@@ -185,21 +185,31 @@ opcode 0x2F
 word 1   FB_EN | FB_FMT_RxB | FB_FMT_8888   = 0x8000 | 0b10000 | 0b00110 = 0x8016
 word 2   fb_addr & 0xFFFF
 word 3   fb_addr >> 16
-word 4   width
-word 5   height
+word 4   fb_width
+word 5   fb_height
 word 6   0                     scaled left
 word 7   hact - 1              scaled right   (item[1] of the current mode)
 word 8   0                     scaled top
 word 9   vact - 1              scaled bottom  (item[5] of the current mode)
-word 10  width * 4             stride, bytes
+word 10  fb_width * 4          stride, bytes
 ```
 
 with `fb_addr = FB_ADDR + 4096` for buffer 0, `FB_ADDR = 0x22000000`
 (`video.cpp:37`, "512 MB + 32 MB"); the 4 KiB skip is the driver's header
-page. Width and height are the mode's active area (1280x720). Disable is the
-opcode followed by a single `0` word.
+page. Disable is the opcode followed by a single `0` word.
 
-Then write `8888 1 <width> <height> <width*4>` to
+`fb_width`/`fb_height` are the **framebuffer's** size and are not in general the
+mode's active area: `video_fb_config()` sets `fb_width = item[1] / fb_scale_x`
+and `fb_height = item[5] / fb_scale_y` (`video.cpp:3575-3576`), where `fb_scale`
+is 2 when `hact * vact > 1920*1080` and 1 otherwise (`video.cpp:3560-3568`, with
+`cfg.fb_size` at 0 — it has no default in `cfg_parse()` and we write no
+`MiSTer.ini`), and `fb_scale_y` doubles again for a pixel-repeat mode
+(`video.cpp:3573`). For both modes in §3 the divisor is 1 and the two pairs
+coincide at 1280x720 and 640x480, which is precisely why the code keeps them
+distinguishable rather than collapsing them: words 4, 5 and 10 take
+`fb_width`/`fb_height` while words 7 and 9 take `hact`/`vact`.
+
+Then write `8888 1 <fb_width> <fb_height> <fb_width*4>` to
 `/sys/module/MiSTer_fb/parameters/mode` (`fb_write_module_params()`,
 `video.cpp:3459-3471`), which makes the kernel driver re-register `/dev/fb0`
 at that geometry so fbcon follows. Do the sysfs write **after** the fabric

@@ -77,11 +77,28 @@ House rules for every task:
 
 ### T1.4 SET_FBUF composer and mode knob text
 - Inputs: ARCHITECTURE §5; `video.cpp:37, 49-57, 3459-3471, 3474-3530`.
-- Do: `fb.rs` with `enable_words(&Modeline) -> [u16; 10]`,
-  `disable_words() -> [u16; 1]`, `mode_param_line(&Modeline) -> String`.
+- Do: `fb.rs` with `enable_words(&FbGeometry) -> [u16; 10]`,
+  `disable_words() -> [u16; 1]`, `mode_param_line(&FbGeometry) -> String`, and
+  `FbGeometry::for_mode(hact, vact, pixel_repeat)` transcribing
+  `video_fb_config()` (`video.cpp:3556-3576`).
+- **Deviation from this task's original wording, which said `&Modeline`.**
+  `Modeline` belongs to T1.2 and lives in `video.rs`; T1.4 runs in parallel with
+  T1.2, so `fb.rs` owns a small `FbGeometry` and does not depend on `video.rs`.
+  T2.2 bridges the two with
+  `fb::FbGeometry::for_mode(m.hact, m.vact, m.pr != 0)` — it does **not**
+  construct the geometry itself. The substance of the change is that the
+  framebuffer's size and the mode's active area are two different pairs of
+  numbers in the C (`fb_width`/`fb_height` feed words 4, 5 and 10;
+  `v_cur.item[1]`/`item[5]` feed words 7 and 9, `video.cpp:3505-3511`), they
+  only coincide for the two modes we ship, and `FbGeometry`'s named private
+  fields make transposing them unexpressible where four positional `u16`s did
+  not.
 - Done when: the 720p burst is asserted word by word (`0x8016`, `0x1000`,
   `0x2200`, `1280`, `720`, `0`, `1279`, `0`, `719`, `5120`) and the sysfs
-  line is `8888 1 1280 720 5120\n`.
+  line is `8888 1 1280 720 5120\n`; and a case where the framebuffer is
+  smaller than the active area (`vmodes[12]`, 1920x1440 downscaled to 960x720)
+  is asserted too, so that words 4/5/10 cannot be swapped with words 7/9
+  without a test going red.
 
 ## Phase 2 — hardware paths and CLI
 
