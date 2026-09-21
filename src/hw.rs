@@ -29,7 +29,7 @@
 //!    `*-musleabihf` (`.../musl/mod.rs:51`). The request constants are written
 //!    as `libc::Ioctl` so both targets compile.
 //! 3. **`mmap`'s offset type differs too, and `0xFF706000` does not fit in the
-//!    smaller one.** See [`map_page`].
+//!    smaller one.** See the two `map_page` arms in the `linux` module below.
 //!
 //! # What is gated, and what is not
 //!
@@ -42,8 +42,9 @@
 //! tty writers are plain `std::fs` and are not gated at all.
 
 use crate::{Error, Result};
+use std::fmt;
 use std::fs::{File, OpenOptions};
-use std::io::Write;
+use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 
 // ---------------------------------------------------------------------------
@@ -78,6 +79,41 @@ pub trait ModeSink {
 pub trait TextSink {
     /// Write every byte of `bytes`, or fail.
     fn write_text(&mut self, bytes: &[u8]) -> Result<()>;
+}
+
+// ---------------------------------------------------------------------------
+// Saying something on a path that is not allowed to die
+// ---------------------------------------------------------------------------
+
+/// Put one line on stderr, and survive a stderr that will not take it.
+///
+/// **This exists because `eprintln!` panics.** `std`'s `print_to` ends with
+/// `panic!("failed printing to stderr: {e}")` when the write fails, which it
+/// does for `ENOSPC` (an installer logging to a full overlay or SD card),
+/// `EPIPE` (stderr into a consumer that has exited) or `EBADF` (fd 2 closed by
+/// the caller). `Cargo.toml` sets `panic = "abort"` for the release profile,
+/// so that panic is a `SIGABRT` on the board: not one of the
+/// `docs/ARCHITECTURE.md` §7 exit codes, and a direct contradiction of §6's
+/// "no panics on the hardware paths". Verified on this host with the shipping
+/// toolchain: a binary whose body is `eprintln!("hello")` exits 101 under
+/// `2>/dev/full` and 0 otherwise.
+///
+/// Both callers here are paths whose whole purpose is to survive a failure —
+/// the NAK log in [`write_table`] and the `munmap` complaint in `MemRegs`'s
+/// [`Drop`], which runs at a point where there is nothing left to do about
+/// anything. Losing a log line there is the correct trade; aborting is not.
+/// It is `pub` because the binary crate has the same problem: the stderr line
+/// that accompanies an exit code must not be able to replace it with a
+/// SIGABRT. **`println!` panics identically**, so anything T2.2 puts on
+/// stdout — `probe`'s findings, `--json` — needs the same treatment there.
+pub fn log(args: fmt::Arguments<'_>) {
+    log_to(io::stderr().lock(), args);
+}
+
+/// [`log`] with the sink named, so a test can hand it one that always fails.
+fn log_to(mut sink: impl Write, args: fmt::Arguments<'_>) {
+    // The whole point: the error is dropped rather than unwrapped.
+    let _ = writeln!(sink, "{args}");
 }
 
 // ---------------------------------------------------------------------------
@@ -117,13 +153,46 @@ pub fn bus_path(bus: u8) -> String {
 /// Probing all three costs two extra `open`/`ioctl`/receive-byte round trips
 /// on a board where the first bus is the right one, which is microseconds.
 ///
-/// `probe` returns `None` for a bus that is not a match, for any reason — that
-/// is the C's `continue`, and it is not an error.
-pub fn discover_bus<T>(mut probe: impl FnMut(u8) -> Option<T>) -> Result<T> {
+/// # "Not a match" and "could not be used" are different answers
+///
+/// `probe` returns `Ok(None)` for a bus that is simply not a match: there is
+/// no `/dev/i2c-N` on this board, or there is and nothing at `0x39` on it
+/// acknowledged. That is the C's `continue` (`smbus.cpp:228-239`, where the
+/// failed `open`, the failed `ioctl` and the failed presence probe are all
+/// `continue`), and it is not an error.
+///
+/// It returns `Err` for a bus that exists and *could not be used*: `EACCES`
+/// because we are not root, `EBUSY` because a kernel driver has claimed
+/// `0x39` on that adapter, an `ioctl` the adapter does not implement. Those
+/// are [`Error::Io`], exit 14, because `docs/ARCHITECTURE.md` §7 promises
+/// that code for "`/dev/i2c-*` … could not be opened" and reserves 12 for
+/// "ADV7513 not found on any bus". Collapsing the first into the second —
+/// which is what discarding the errno here used to do — tells the installer
+/// log that the board has no HDMI transmitter when what it has is a
+/// permissions problem, and exit 12 is a code the installer is told to pass
+/// over silently. The C can afford the conflation because its caller only
+/// wants a descriptor (`video.cpp:1470-1474` prints "ADV7513 not found" and
+/// carries on); our caller's whole output is the exit code.
+///
+/// **An unusable bus never hides a usable one.** The scan always runs to the
+/// end, and a remembered error is reported only when *nothing* answered, so a
+/// driver sitting on `0x39` on `/dev/i2c-0` cannot stop us finding the chip on
+/// `/dev/i2c-2`. That keeps the C's tolerance where it buys something and
+/// spends it nowhere else.
+pub fn discover_bus<T>(mut probe: impl FnMut(u8) -> Result<Option<T>>) -> Result<T> {
     let mut found: Vec<(u8, T)> = Vec::new();
+    let mut unusable: Option<Error> = None;
     for bus in I2C_BUSES {
-        if let Some(handle) = probe(bus) {
-            found.push((bus, handle));
+        match probe(bus) {
+            Ok(Some(handle)) => found.push((bus, handle)),
+            Ok(None) => {}
+            Err(e) => {
+                // Keep the first: a later bus can only add noise, and the
+                // message already names the bus it came from.
+                if unusable.is_none() {
+                    unusable = Some(e);
+                }
+            }
         }
     }
 
@@ -135,7 +204,11 @@ pub fn discover_bus<T>(mut probe: impl FnMut(u8) -> Option<T>) -> Result<T> {
     }
     match found.pop() {
         Some((_, handle)) => Ok(handle),
-        None => Err(Error::NoAdv7513),
+        // Nothing answered. If a bus was there and refused us, say *that*.
+        None => match unusable {
+            Some(e) => Err(e),
+            None => Err(Error::NoAdv7513),
+        },
     }
 }
 
@@ -159,6 +232,22 @@ pub fn discover_bus<T>(mut probe: impl FnMut(u8) -> Option<T>) -> Result<T> {
 /// (`video.cpp:1606-1611`, and the same three lines again at `:1455-1459` for
 /// the audio table.) It prints and keeps going; nothing aborts the table and
 /// nothing is retried.
+///
+/// **The policy is not limited to the two bulk tables, and neither is this
+/// function.** Main log-and-continues at *every* ADV7513 write site:
+/// `hdmi_config_set_csc()` (`video.cpp:1399-1403`), the three mode registers
+/// `0x17`/`0x3B`/`0x3C` in `hdmi_config_set_mode()` (`video.cpp:1716-1722`),
+/// and the `0x41 = 0x10`/`0x50` of `tmds_power()` (`video.cpp:2737-2745`),
+/// which is the write `docs/ARCHITECTURE.md` §4 assigns to `hdmi --off`. So
+/// **every** i2c write this tool makes goes through here, not only the long
+/// ones — `write_table(bus, adv7513::mode_regs(hpol, vpol, vic, pr))` and
+/// `write_table(bus, [adv7513::POWER_DOWN])` are the intended calls, and both
+/// compile as they stand because the argument is any
+/// `IntoIterator<Item = (u8, u8)>`. Reaching past this function to
+/// [`I2cBus::write_reg`] and applying `?` to it would turn a single NAK that
+/// Main survives into exit 14 for the whole run; the tests below pin the mode
+/// and power registers to this path so that drift shows up as a red test and
+/// not as a dark screen.
 ///
 /// **A NAK and an ioctl-level failure are tolerated alike, and that is the C's
 /// behaviour, not an accident of ours.** `i2c_smbus_access()` ends with
@@ -184,7 +273,9 @@ where
         if let Err(e) = bus.write_reg(reg, value) {
             // `video.cpp:1609`'s message, with the OS error where the C puts
             // the negative errno.
-            eprintln!("i2c: write error ({reg:02X} {value:02X}): {e}");
+            log(format_args!(
+                "i2c: write error ({reg:02X} {value:02X}): {e}"
+            ));
             failed = failed.saturating_add(1);
         }
     }
@@ -476,7 +567,10 @@ mod linux {
                 // `shmem_unmap()` prints and carries on (`shmem.cpp:42-46`).
                 // There is nothing else to do in a destructor, and panicking
                 // is banned on a hardware path.
-                eprintln!("itsalive: munmap {DEV_MEM}: {}", io::Error::last_os_error());
+                super::log(format_args!(
+                    "itsalive: munmap {DEV_MEM}: {}",
+                    io::Error::last_os_error()
+                ));
             }
             // `_mem` drops immediately after this, closing `/dev/mem`.
         }
@@ -643,6 +737,48 @@ mod linux {
     #[cfg(target_pointer_width = "32")]
     const _: () = assert!(size_of::<I2cSmbusIoctlData>() == 12);
 
+    /// Which of `i2c_open()`'s two setup steps failed (`smbus.cpp:226-239`),
+    /// so that one message can be built from either caller's rules.
+    #[derive(Clone, Copy, Debug)]
+    enum OpenStep {
+        /// `open("/dev/i2c-N", O_RDWR | O_CLOEXEC)` (`smbus.cpp:228`).
+        Open,
+        /// `ioctl(fd, I2C_SLAVE, dev_address)` (`smbus.cpp:234`).
+        SetSlave,
+    }
+
+    /// Does this `open(2)` failure mean "this board has no such i2c bus"?
+    ///
+    /// `ENOENT` is the ordinary answer for `/dev/i2c-2` on a board with two
+    /// adapters, and `ENODEV` is what a device node whose driver is gone
+    /// gives. Neither is a failure of ours, so the scan treats them as the
+    /// C's `continue` (`smbus.cpp:228-231`). Everything else — `EACCES` (not
+    /// root), `EPERM`, `EBUSY`, `ENOMEM` — is a bus that is *there* and that
+    /// we could not open, which is exactly the sentence in
+    /// `docs/ARCHITECTURE.md` §7 next to exit 14.
+    fn bus_is_absent(e: &io::Error) -> bool {
+        matches!(e.raw_os_error(), Some(libc::ENOENT | libc::ENODEV))
+    }
+
+    /// Does this transfer failure mean "nothing at that address answered"?
+    ///
+    /// A chip that does not acknowledge its address comes back as `ENXIO`
+    /// from most adapters and `EREMOTEIO` from others — the DE10-Nano's
+    /// controller is the DesignWare one, which reports a `NOACK` abort, and
+    /// which of the two errnos that surfaces as has not been read off the rig
+    /// yet, so both are accepted — and `ETIMEDOUT` is the answer from an
+    /// adapter that gave up on a bus nobody is driving. All three mean "not
+    /// here", which is the C's `continue` at `smbus.cpp:250-257`. An `EBADF`,
+    /// `ENOTTY` or `EOPNOTSUPP` does not: that is a descriptor or an adapter
+    /// that cannot do this at all, and the difference is exit 14 against
+    /// exit 12.
+    fn no_one_answered(e: &io::Error) -> bool {
+        matches!(
+            e.raw_os_error(),
+            Some(libc::ENXIO | libc::EREMOTEIO | libc::ETIMEDOUT)
+        )
+    }
+
     /// The ADV7513 over one `/dev/i2c-N`.
     #[derive(Debug)]
     pub struct I2c {
@@ -659,16 +795,32 @@ mod linux {
         /// Unlike [`Self::open_adv7513`] this reports why it failed, because
         /// a caller naming one bus meant that bus.
         pub fn open_bus(bus: u8, addr: u8) -> Result<Self> {
+            Self::open_and_select(bus, addr)
+                .map_err(|(step, e)| Error::io(Self::step_failed(step, bus, addr), e))
+        }
+
+        /// The `open` and the `I2C_SLAVE` ioctl, with the errno and which of
+        /// the two produced it, because [`Self::open_bus`] reports every
+        /// failure and [`Self::probe`] has to sort them first.
+        fn open_and_select(bus: u8, addr: u8) -> std::result::Result<Self, (OpenStep, io::Error)> {
             let path = bus_path(bus);
             let file = OpenOptions::new()
                 .read(true)
                 .write(true)
                 .open(&path)
-                .map_err(|e| Error::io(format!("open {path}"), e))?;
+                .map_err(|e| (OpenStep::Open, e))?;
             let i2c = Self { file, bus, addr };
-            i2c.set_slave()
-                .map_err(|e| Error::io(format!("ioctl I2C_SLAVE {addr:#04X} on {path}"), e))?;
+            i2c.set_slave().map_err(|e| (OpenStep::SetSlave, e))?;
             Ok(i2c)
+        }
+
+        /// What [`Error::Io`]'s `what` says about a failed setup step.
+        fn step_failed(step: OpenStep, bus: u8, addr: u8) -> String {
+            let path = bus_path(bus);
+            match step {
+                OpenStep::Open => format!("open {path}"),
+                OpenStep::SetSlave => format!("ioctl I2C_SLAVE {addr:#04X} on {path}"),
+            }
         }
 
         /// Find the one bus the ADV7513 answers on and open it.
@@ -680,13 +832,19 @@ mod linux {
             discover_bus(|bus| Self::probe(bus, crate::adv7513::CHIP_ADDR))
         }
 
-        /// One bus of the scan: a match, or `None`.
+        /// One bus of the scan: a match, a considered "no", or a bus that
+        /// exists and cannot be used.
         ///
         /// `smbus.cpp:223-262`. Three things have to work — the `open`, the
         /// `I2C_SLAVE` ioctl and the presence probe — and in the C each
         /// failure is a `continue` that closes the descriptor and moves to
-        /// the next bus. None of them is an error here either: a board simply
-        /// does not have an ADV7513 on every bus.
+        /// the next bus. Most of them are not errors here either: a board
+        /// simply does not have an ADV7513 on every bus, and often does not
+        /// have every bus. But the errno says which case this is, and
+        /// [`discover_bus`] needs it to choose between exit 12 and exit 14 —
+        /// see its doc for why that distinction is worth the two classifier
+        /// functions. `Ok(None)` is the C's `continue`; `Err` is a bus that
+        /// answered the question "can I use you?" with `EACCES` or `EBUSY`.
         ///
         /// The presence probe is an SMBus **receive byte**. That is what
         /// `i2c_open()` does for a device opened with `is_smbus = 0`
@@ -694,10 +852,25 @@ mod linux {
         /// (`video.cpp:1470`); the `is_smbus = 1` arm's *write quick*
         /// (`:243-248`) is for real SMBus parts and would put a bare address
         /// with no data on the wire.
-        fn probe(bus: u8, addr: u8) -> Option<Self> {
-            let i2c = Self::open_bus(bus, addr).ok()?;
-            i2c.receive_byte().ok()?;
-            Some(i2c)
+        fn probe(bus: u8, addr: u8) -> Result<Option<Self>> {
+            let i2c = match Self::open_and_select(bus, addr) {
+                Ok(i2c) => i2c,
+                // No such `/dev/i2c-N`: nothing to report, nothing wrong.
+                Err((OpenStep::Open, ref e)) if bus_is_absent(e) => return Ok(None),
+                // Anything else, from either step, is a bus we could not
+                // have. `I2C_SLAVE` fails with `EBUSY` when a kernel driver
+                // owns the address and `EINVAL` when the address is out of
+                // range, which `0x39` is not; neither means "no chip".
+                Err((step, e)) => return Err(Error::io(Self::step_failed(step, bus, addr), e)),
+            };
+            match i2c.receive_byte() {
+                Ok(_) => Ok(Some(i2c)),
+                Err(ref e) if no_one_answered(e) => Ok(None),
+                Err(e) => Err(Error::io(
+                    format!("i2c probe {addr:#04X} on {}", bus_path(bus)),
+                    e,
+                )),
+            }
         }
 
         /// The bus this handle is open on.
@@ -763,8 +936,17 @@ mod linux {
         /// = I2C_SMBUS_WRITE`, `command = reg`, `size = I2C_SMBUS_BYTE_DATA`,
         /// `data.byte = value`.
         ///
-        /// A failure here is one register, not the run: see [`write_table`]
-        /// for the policy and why it is the C's.
+        /// **A failure here is one register, not the run — but only if the
+        /// caller goes through [`crate::hw::write_table`], which is where
+        /// that policy lives and which cites the C for it.** This method is
+        /// the transport: it reports the `errno` so `write_table` can name it
+        /// in the log line, and it is `pub` only because it is the trait
+        /// method a recording fake implements. Do not apply `?` to it on the
+        /// ADV7513 path. Main tolerates a refused write at every one of its
+        /// i2c write sites, the three mode registers and the power register
+        /// included (`video.cpp:1716-1722`, `:2737-2745`); a `?` here would
+        /// make one NAK exit 14 and leave the screen dark where Main would
+        /// have shown a picture.
         fn write_reg(&mut self, reg: u8, value: u8) -> Result<()> {
             let mut data = I2cSmbusData {
                 block: [0; I2C_SMBUS_BLOCK_MAX + 2],
@@ -908,6 +1090,33 @@ mod linux {
             assert_eq!(read.read_write, 1);
             assert_eq!(read.command, 0);
             assert_eq!(read.size, 1);
+        }
+
+        /// `ENOENT` on `/dev/i2c-2` is a board with two adapters, not a
+        /// failure; `EACCES` on `/dev/i2c-0` is a failure. The exit code
+        /// depends on telling them apart.
+        #[test]
+        fn only_a_missing_node_means_the_bus_is_absent() {
+            for errno in [libc::ENOENT, libc::ENODEV] {
+                assert!(bus_is_absent(&io::Error::from_raw_os_error(errno)));
+            }
+            for errno in [libc::EACCES, libc::EPERM, libc::EBUSY, libc::ENOMEM] {
+                assert!(!bus_is_absent(&io::Error::from_raw_os_error(errno)));
+            }
+        }
+
+        /// A chip that does not acknowledge is `ENXIO`, `EREMOTEIO` or
+        /// `ETIMEDOUT` depending on the adapter; a descriptor or adapter that
+        /// cannot do the transaction at all is not, and must not be read as
+        /// "no ADV7513 here".
+        #[test]
+        fn only_a_nak_means_nobody_answered() {
+            for errno in [libc::ENXIO, libc::EREMOTEIO, libc::ETIMEDOUT] {
+                assert!(no_one_answered(&io::Error::from_raw_os_error(errno)));
+            }
+            for errno in [libc::EACCES, libc::EBADF, libc::ENOTTY, libc::EOPNOTSUPP] {
+                assert!(!no_one_answered(&io::Error::from_raw_os_error(errno)));
+            }
         }
 
         /// The real `Regs` implements the trait the fake does. This cannot be
@@ -1074,7 +1283,7 @@ mod tests {
         let mut seen = Vec::new();
         let _ = discover_bus(|bus| {
             seen.push(bus);
-            None::<u8>
+            Ok(None::<u8>)
         });
         // The C stops at the first answer; we do not, which is the whole
         // point of the divergence.
@@ -1083,20 +1292,20 @@ mod tests {
 
     #[test]
     fn one_answer_is_the_bus() {
-        let got = discover_bus(|bus| (bus == 1).then_some(bus));
+        let got = discover_bus(|bus| Ok((bus == 1).then_some(bus)));
         assert_eq!(got.ok(), Some(1));
     }
 
     #[test]
     fn no_answer_is_no_adv7513() {
-        let err = discover_bus(|_| None::<u8>).unwrap_err();
+        let err = discover_bus(|_| Ok(None::<u8>)).unwrap_err();
         assert!(matches!(err, Error::NoAdv7513));
         assert_eq!(err.exit_code(), 12);
     }
 
     #[test]
     fn two_answers_are_ambiguous_and_name_the_buses() {
-        let err = discover_bus(|bus| (bus != 1).then_some(bus)).unwrap_err();
+        let err = discover_bus(|bus| Ok((bus != 1).then_some(bus))).unwrap_err();
         match &err {
             Error::AmbiguousBus(buses) => assert_eq!(buses, &[0, 2]),
             other => panic!("expected AmbiguousBus, got {other:?}"),
@@ -1106,11 +1315,125 @@ mod tests {
 
     #[test]
     fn three_answers_are_ambiguous_too() {
-        let err = discover_bus(Some).unwrap_err();
+        let err = discover_bus(|bus| Ok(Some(bus))).unwrap_err();
         match err {
             Error::AmbiguousBus(buses) => assert_eq!(buses, vec![0, 1, 2]),
             other => panic!("expected AmbiguousBus, got {other:?}"),
         }
+    }
+
+    /// A bus that is there and will not let us in is exit 14, not exit 12.
+    ///
+    /// `docs/ARCHITECTURE.md` §7 gives 12 to "ADV7513 not found on any bus",
+    /// which the installer passes over silently, and 14 to "`/dev/i2c-*` …
+    /// could not be opened". Running the tool as a non-root user is the
+    /// everyday way to produce this, and it must not read as "your board has
+    /// no HDMI transmitter".
+    #[test]
+    fn a_bus_that_refuses_us_is_exit_14() {
+        let err = discover_bus(|bus| {
+            if bus == 0 {
+                Err(Error::io(
+                    "open /dev/i2c-0",
+                    std::io::Error::from_raw_os_error(libc::EACCES),
+                ))
+            } else {
+                Ok(None::<u8>)
+            }
+        })
+        .unwrap_err();
+        assert_eq!(err.exit_code(), 14);
+        match err {
+            Error::Io { source, .. } => assert_eq!(source.raw_os_error(), Some(libc::EACCES)),
+            other => panic!("expected Io, got {other:?}"),
+        }
+    }
+
+    /// The scan runs to the end, so a bus we cannot use cannot cost us the
+    /// one the chip is on. That is the C's `continue` (`smbus.cpp:228-239`)
+    /// kept where it earns its keep.
+    #[test]
+    fn an_unusable_bus_does_not_hide_the_one_that_answers() {
+        let got = discover_bus(|bus| match bus {
+            0 => Err(Error::io(
+                "open /dev/i2c-0",
+                std::io::Error::from_raw_os_error(libc::EBUSY),
+            )),
+            2 => Ok(Some(2)),
+            _ => Ok(None),
+        });
+        assert_eq!(got.ok(), Some(2));
+    }
+
+    /// Two answers are still ambiguous even when a third bus was unusable:
+    /// the error we could not act on does not displace the one we can.
+    #[test]
+    fn ambiguity_outranks_an_unusable_bus() {
+        let err = discover_bus(|bus| match bus {
+            0 => Err(Error::io(
+                "open /dev/i2c-0",
+                std::io::Error::from_raw_os_error(libc::EACCES),
+            )),
+            _ => Ok(Some(bus)),
+        })
+        .unwrap_err();
+        assert_eq!(err.exit_code(), 13);
+        match err {
+            Error::AmbiguousBus(buses) => assert_eq!(buses, vec![1, 2]),
+            other => panic!("expected AmbiguousBus, got {other:?}"),
+        }
+    }
+
+    /// One message, from the first bus that gave one, so the line names a bus
+    /// rather than summarising three.
+    #[test]
+    fn the_first_unusable_bus_is_the_one_reported() {
+        let err = discover_bus(|bus| {
+            Err::<Option<u8>, _>(Error::io(
+                format!("open /dev/i2c-{bus}"),
+                std::io::Error::from_raw_os_error(libc::EACCES),
+            ))
+        })
+        .unwrap_err();
+        // Not `err.to_string()`: `strerror` is locale-dependent, and this is
+        // about which bus is named, not about how the C library spells
+        // EACCES.
+        match err {
+            Error::Io { what, source } => {
+                assert_eq!(what, "open /dev/i2c-0");
+                assert_eq!(source.raw_os_error(), Some(libc::EACCES));
+            }
+            other => panic!("expected Io, got {other:?}"),
+        }
+    }
+
+    /// [`log`] must return even when the line cannot be written. `eprintln!`
+    /// panics there, and with `panic = "abort"` that is a SIGABRT whose exit
+    /// status is not one of the `docs/ARCHITECTURE.md` §7 codes.
+    #[test]
+    fn logging_survives_a_sink_that_refuses_the_line() {
+        struct Full;
+        impl std::io::Write for Full {
+            fn write(&mut self, _buf: &[u8]) -> std::io::Result<usize> {
+                Err(std::io::Error::from_raw_os_error(libc::ENOSPC))
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Err(std::io::Error::from_raw_os_error(libc::ENOSPC))
+            }
+        }
+        // The assertion is that this returns at all.
+        log_to(Full, format_args!("i2c: write error (41 50): {}", 6));
+    }
+
+    /// And that it is otherwise `eprintln!`: one line, newline included.
+    #[test]
+    fn logging_writes_one_line() {
+        let mut sink: Vec<u8> = Vec::new();
+        log_to(
+            &mut sink,
+            format_args!("i2c: write error ({:02X} {:02X}): x", 0x41, 0x50),
+        );
+        assert_eq!(sink, b"i2c: write error (41 50): x\n");
     }
 
     /// A refused write must not end the table: that is `video.cpp:1608-1609`.
@@ -1140,6 +1463,27 @@ mod tests {
         assert_eq!(
             bus.writes.last().copied(),
             crate::adv7513::CSC.last().copied()
+        );
+    }
+
+    /// The three mode registers and the power register go through the same
+    /// tolerant path as the bulk tables, because Main tolerates a NAK on them
+    /// too (`video.cpp:1716-1722` and `:2737-2745`). This is the shape T2.2
+    /// is meant to copy: `write_table`, not `write_reg` with a `?`, which
+    /// would turn one NAK into exit 14 and a dark screen.
+    #[test]
+    fn the_mode_and_power_registers_go_through_the_tolerant_path() {
+        let mut bus = FakeBus::new(&[0x3C, 0x41]);
+        // 720p: hpol = 0, vpol = 0, VIC 4, no pixel repetition.
+        assert_eq!(
+            write_table(&mut bus, crate::adv7513::mode_regs(0, 0, 4, 0)),
+            1
+        );
+        assert_eq!(write_table(&mut bus, [crate::adv7513::POWER_DOWN]), 1);
+        // Every write was attempted: the refused 0x3C did not stop 0x41.
+        assert_eq!(
+            bus.writes,
+            vec![(0x17, 0x62), (0x3B, 0x40), (0x3C, 0x04), (0x41, 0x50)]
         );
     }
 

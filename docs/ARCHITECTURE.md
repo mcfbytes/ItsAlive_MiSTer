@@ -172,9 +172,29 @@ Default mode: **1280x720@60**, `Fpix = 74.25`, timings
   SMBus receive-byte as the presence probe, and refuse with a distinct exit
   code if more than one bus answers (a fourth adapter in the DT would make
   the wrong bus win silently). `CONFIG_I2C_CHARDEV=y` in our kernel.
+- **A bus that is missing and a bus that refuses us are different
+  failures.** The C's scan makes every setup failure a `continue`
+  (`smbus.cpp:228-239`) because its caller only wants a descriptor; our
+  caller's whole output is the exit code, so the errno decides. A bus that
+  is not there (`ENOENT`/`ENODEV` from the `open`) or that nothing answers on
+  (`ENXIO`, `EREMOTEIO` — adapters differ over which one a NOACK becomes, so
+  both count — or `ETIMEDOUT` from the probe) is skipped exactly as the C
+  skips it, and if no bus answers that is exit 12. A bus that exists and
+  cannot be used — `EACCES` because we are not root, `EBUSY` because a kernel
+  driver has claimed `0x39`, an adapter that cannot do the transaction — is
+  exit 14, which is what §7 promises for "`/dev/i2c-*` … could not be
+  opened"; exit 12 would be a lie the installer is told to pass over
+  silently. The scan still probes all three buses and only reports such an
+  error when *nothing* answered, so an unusable bus can never hide the one
+  the chip is on.
 - **Transport.** `ioctl(I2C_SLAVE, 0x39)` then SMBus *write byte data* per
   register (`i2c_smbus_write_byte_data`, `video.cpp:1610`). One NAK is logged
-  and the table continues, as Main does.
+  and the table continues, as Main does — and that holds at **every** i2c
+  write site, not just the bulk tables: Main log-and-continues in
+  `hdmi_config_set_csc()` (`video.cpp:1399-1403`), for the three mode
+  registers (`:1716-1722`) and for `tmds_power()`'s `0x41` (`:2737-2745`)
+  alike. So every write goes through `hw::write_table`, which owns the
+  policy and counts the refusals; a refused register never fails the run.
 - **Tables.** Transcribe verbatim, in order, as `(reg, value)` byte pairs:
   `init_data[]` in `hdmi_config_init()` (`video.cpp:1499-1607`, the table
   whose first row is `0x98, 0x03` and last row `0xFA, 0x7D`), then the audio
@@ -311,7 +331,12 @@ Rules:
   same wide call from `-D_FILE_OFFSET_BITS=64`, `Makefile:52`). Neither can be
   settled by reasoning: both targets get built.
 - **No panics on the hardware paths.** Every error is a typed enum mapped to
-  an exit code (§7). `unwrap()` is banned outside tests.
+  an exit code (§7). `unwrap()` is banned outside tests, and so are
+  `eprintln!` and `println!`: both **panic** if the write fails (a full
+  overlay, stderr into a consumer that exited, fd 2 closed), and with
+  `panic = "abort"` in the release profile that panic is a SIGABRT whose
+  status is not one of the §7 codes. Diagnostics go through `hw::log`, which
+  drops the write error instead.
 
 ## 7. CLI and exit codes
 
