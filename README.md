@@ -1,3 +1,5 @@
+<p align="center"><img src="art/banner.png" alt="MiSTer It's Alive" width="100%"></p>
+
 # ItsAlive_MiSTer
 
 > *"It's alive! IT'S ALIVE!"* — Dr. Frankenstein, on getting a picture out of a
@@ -27,7 +29,7 @@ itsalive image splash.raw       # or a picture
 `itsalive up` is `hdmi` followed by `fb enable`, which is the one call an
 installer needs.
 
-## Commands
+## <img src="art/icons/lever-48.png" width="24" alt=""> Commands
 
 ```
 itsalive probe [--json]              report what is there, exit with the first failure
@@ -69,6 +71,10 @@ itsalive up
 zcat splash.raw.gz | itsalive image -
 ```
 
+There is one ready-made: [`art/splash.raw.gz`](art/splash.raw.gz) is
+[`art/splash.png`](art/splash.png), Alive Kun saying "Installing MiSTer... Do
+not power off.", already converted to 1280x720 BGRX.
+
 A 1280x720 frame is 3.6 MB raw, which gzips to around 20 KB for flat artwork and
 blits in about 0.13 s. `--size WxH` declares the *source's* dimensions and
 defaults to the whole framebuffer; a smaller source is centred, with an odd
@@ -88,7 +94,7 @@ Two things worth knowing before wiring this into a script:
   `echo 0 > /sys/class/graphics/fbcon/cursor_blink`. It does not persist across
   a reboot, so set it each boot and never restore it.
 
-## Building
+## <img src="art/icons/tesla-48.png" width="24" alt=""> Building
 
 Rust 1.97 or newer; the toolchain is pinned in `rust-toolchain.toml` and the
 linkers in `.cargo/config.toml`. No Docker and no `cross`.
@@ -112,7 +118,7 @@ Main_MiSTer's own PLL and ADV7513 functions and running them — never by copyin
 bytes out of the Rust. `tests/golden/gen.sh` and `tests/golden/adv7513-gen.sh`
 regenerate them in place, and CI fails on any diff.
 
-## Status
+## <img src="art/icons/heartbeat-48.png" width="24" alt=""> Status
 
 **Working on hardware.** On 2026-09-21 a DE10-Nano with no Main_MiSTer on the
 card went from a dark HDMI output to a 1280x720 picture, then console text,
@@ -134,7 +140,7 @@ Read, in order:
    — what the board actually did, register by register.
 4. [`TASKS.md`](TASKS.md) — the task list the implementation agents work from.
 
-## What it is not
+## <img src="art/icons/power-48.png" width="24" alt=""> What it is not
 
 - Not a replacement for Main_MiSTer, not a core loader, not an OSD. It programs
   the PLL, the timings and the ADV7513, commits the mode, and gets out of the
@@ -145,7 +151,34 @@ Read, in order:
 - Not an image decoder. It blits raw pixels; PNG and JPEG stay on the build
   host, where there is a real image library and no reason to ship one here.
 
-## License
+## <img src="art/icons/zap-48.png" width="24" alt=""> The art
+
+Meet Alive Kun: MiSTer Kun, stitched together, bolted through the cheeks and
+jolted back to life by a board everyone had given up for dead. (Yes, the doctor
+is Frankenstein. The cat is the monster.)
+
+| | | |
+|:-:|:-:|:-:|
+| <img src="art/alive-kun.png" width="200" alt="Alive Kun: MiSTer Kun as Frankenstein's monster, with a flat-top, forehead stitches and neck bolts"> | <img src="art/alive-kun-zapped.png" width="200" alt="Alive Kun wide-eyed, with lightning overhead and sparks off his neck bolts"> | <img src="art/alive-kun-lever.png" width="200" alt="Alive Kun beside a lab knife switch, thrown"> |
+| **On the slab** | **It's alive!** | **Throw the switch** |
+| <img src="art/alive-kun-hdmi.png" width="200" alt="Alive Kun with a sparking HDMI plug"> | <img src="art/alive-kun-chip.png" width="200" alt="Alive Kun holding an ADV7513 chip"> | <img src="art/alive-kun-monitor.png" width="200" alt="Alive Kun with a monitor reading INSTALLING, DO NOT POWER OFF"> |
+| **HDMI** | **ADV7513** | **Do not power off** |
+| <img src="art/alive-kun-power.png" width="200" alt="Alive Kun with a power button taped over, DON'T!"> | <img src="art/alive-kun-sdcard.png" width="200" alt="Alive Kun with a bandaged SD card"> | <img src="art/alive-kun-heartbeat.png" width="200" alt="Alive Kun with a heart monitor showing a pulse"> |
+| **DON'T!** | **Not bricked** | **Vital signs** |
+
+There is a pixel version too: <img src="art/alive-kun-8bit-32x32.png" width="32" alt="8-bit Alive Kun"> at 32x32
+([big](art/alive-kun-8bit.png)), plus a [Jacob's ladder](art/alive-kun-tesla.png). Every variant comes as SVG
+and PNG in [`art/`](art/), along with the [banner](art/banner.png), the
+[social preview](art/social-preview.png) and the [installer splash](art/splash.png). Heading icons live in
+[`art/icons/`](art/icons/). The generator is [`art-src/gen.py`](art-src/gen.py): it needs Inkscape,
+ImageMagick, Open Sans ExtraBold Italic, Noto Sans JP and the upstream `mister_kun_fullcolor.svg`.
+
+MiSTer Kun was created by [HeWhoisRed](https://github.com/Hewhoisred) as a gift to the MiSTer community and
+remastered by [baxysquare](https://github.com/baxysquare/mister_kun). The artwork here is derived from that
+remaster and shared on the same terms: use it and remix it freely, and credit the original creator where you
+can. The GPL below covers the code, not the art.
+
+## <img src="art/icons/stitches-48.png" width="24" alt=""> License
 
 GPL-3.0-or-later. The register sequences are transcribed from
 [Main_MiSTer](https://github.com/MiSTer-devel/Main_MiSTer) (GPL-3.0), which makes
