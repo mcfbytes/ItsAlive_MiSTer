@@ -3,3 +3,6 @@ Cargo.lock.bak
 
 # Claude Code scratch, including the linked worktrees agents run in.
 /.claude/
+
+# Scratch output of the art generator
+/art-src/out-scratch/
