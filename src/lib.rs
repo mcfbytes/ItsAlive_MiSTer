@@ -13,6 +13,8 @@
 #![forbid(unsafe_op_in_unsafe_fn)]
 
 pub mod adv7513;
+pub mod board;
+pub mod de25;
 pub mod fb;
 pub mod hw;
 pub mod mailbox;
@@ -38,6 +40,10 @@ pub enum Error {
     /// More than one `/dev/i2c-N` answered at 0x39, so the bus is ambiguous
     /// and picking the first would silently pick the wrong one. Exit 13.
     AmbiguousBus(Vec<u8>),
+    /// DE25: the fabric is not known to be configured, so touching the LW
+    /// bridge could be an SError (`docs/ARCHITECTURE.md` §9). Exit 10, the
+    /// same verdict as GPI bit 31 on the DE10.
+    FabricNotReady(String),
     /// `/dev/mem`, `/dev/i2c-*`, sysfs or a tty could not be opened or used.
     /// Exit 14.
     Io {
@@ -46,6 +52,10 @@ pub enum Error {
         /// The underlying OS error.
         source: std::io::Error,
     },
+    /// Not a board or a bitstream this tool knows: an unrecognised
+    /// `/proc/device-tree/compatible` on a non-ARMv7 build, or a DE25 fabric
+    /// whose mailbox MAGIC is wrong. Exit 15.
+    Unrecognised(String),
 }
 
 impl Error {
@@ -53,11 +63,12 @@ impl Error {
     pub fn exit_code(&self) -> i32 {
         match self {
             Error::Usage(_) => 2,
-            Error::NoBitstream => 10,
+            Error::NoBitstream | Error::FabricNotReady(_) => 10,
             Error::Timeout => 11,
             Error::NoAdv7513 => 12,
             Error::AmbiguousBus(_) => 13,
             Error::Io { .. } => 14,
+            Error::Unrecognised(_) => 15,
         }
     }
 
@@ -85,7 +96,9 @@ impl fmt::Display for Error {
             Error::AmbiguousBus(buses) => {
                 write!(f, "ADV7513 answered on more than one i2c bus: {buses:?}")
             }
+            Error::FabricNotReady(why) => write!(f, "fabric not ready: {why}"),
             Error::Io { what, source } => write!(f, "{what}: {source}"),
+            Error::Unrecognised(what) => write!(f, "unrecognised: {what}"),
         }
     }
 }

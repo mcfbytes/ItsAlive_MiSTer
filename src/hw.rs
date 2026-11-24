@@ -633,6 +633,7 @@ pub fn read_source(path: &str, limit: u64) -> Result<Vec<u8>> {
 #[cfg(target_os = "linux")]
 mod linux {
     use super::{I2cBus, bus_path, discover_bus};
+    use crate::de25::{self, LwWindow};
     use crate::mailbox;
     use crate::{Error, Result};
     use libc::{c_int, c_void};
@@ -856,6 +857,118 @@ mod linux {
                 fd,
                 offset as libc::off_t,
             )
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // UIO (the DE25's LW bridge)
+    // -----------------------------------------------------------------------
+
+    /// Map 0 of a UIO node, found by its sysfs `name`: the DE25's LW window.
+    ///
+    /// Never `/dev/mem`: the DE25 kernel has `STRICT_DEVMEM`, and the node's
+    /// name is the contract the device tree publishes. UIO maps physical
+    /// memory uncached (`pgprot_noncached`), which on arm64 is Device memory:
+    /// aligned 32-bit volatile accesses only, which is all [`LwWindow`] does.
+    #[derive(Debug)]
+    pub struct UioMap {
+        /// What [`Drop`] hands back to `munmap`.
+        base: *mut c_void,
+        /// The mapped length, at least [`de25::LW_SPAN`].
+        len: usize,
+        /// Closed after the `munmap`, as [`MemRegs`]'s.
+        _dev: File,
+    }
+
+    impl UioMap {
+        /// Open the UIO node named `name` and map enough of its map 0 to
+        /// reach [`de25::LW_SPAN`]. Mapping touches no register.
+        pub fn open(name: &str) -> Result<Self> {
+            let (index, size) = super::find_uio(std::path::Path::new(super::UIO_CLASS), name)?;
+            // SAFETY: sysconf has no preconditions.
+            let page =
+                usize::try_from(unsafe { libc::sysconf(libc::_SC_PAGESIZE) }).unwrap_or(4096);
+            let len = de25::LW_SPAN.div_ceil(page).saturating_mul(page);
+            if size < len {
+                return Err(Error::Unrecognised(format!(
+                    "{name}: map0 is {size:#X} bytes, the mailbox needs {len:#X}"
+                )));
+            }
+            let path = format!("/dev/uio{index}");
+            let dev = OpenOptions::new()
+                .read(true)
+                .write(true)
+                .custom_flags(libc::O_SYNC)
+                .open(&path)
+                .map_err(|e| Error::io(format!("open {path}"), e))?;
+            // SAFETY: a null hint disturbs no mapping; `dev` is live; offset
+            // 0 selects map 0 (`uio_mmap` takes the map index from
+            // `vm_pgoff`); the result is checked against MAP_FAILED before use.
+            let base = unsafe {
+                libc::mmap(
+                    ptr::null_mut(),
+                    len,
+                    libc::PROT_READ | libc::PROT_WRITE,
+                    libc::MAP_SHARED,
+                    dev.as_raw_fd(),
+                    0,
+                )
+            };
+            if base == libc::MAP_FAILED {
+                return Err(Error::io(
+                    format!("mmap {path}"),
+                    io::Error::last_os_error(),
+                ));
+            }
+            Ok(Self {
+                base,
+                len,
+                _dev: dev,
+            })
+        }
+
+        /// The word at `offset`, if it is aligned and inside the mapping.
+        fn word(&self, offset: usize) -> Option<*mut u32> {
+            if !offset.is_multiple_of(4) || offset.checked_add(4)? > self.len {
+                return None;
+            }
+            // SAFETY: `offset + 4 <= len`, so the pointer stays inside the
+            // one mapping `base` starts; `base` is page aligned and `offset`
+            // a multiple of 4, so it is aligned for `u32`.
+            Some(unsafe { self.base.cast::<u8>().add(offset).cast::<u32>() })
+        }
+    }
+
+    impl LwWindow for UioMap {
+        fn read32(&self, offset: usize) -> u32 {
+            // Out of range cannot happen with this crate's constants (checked
+            // against LW_SPAN in `open`); it reads as 0, never as a fault.
+            match self.word(offset) {
+                // SAFETY: in bounds and aligned (`word`), mapping alive for
+                // `self`'s lifetime; volatile because it is a device register.
+                Some(p) => unsafe { p.read_volatile() },
+                None => 0,
+            }
+        }
+
+        fn write32(&mut self, offset: usize, value: u32) {
+            if let Some(p) = self.word(offset) {
+                // SAFETY: as `read32`.
+                unsafe { p.write_volatile(value) }
+            }
+        }
+    }
+
+    impl Drop for UioMap {
+        fn drop(&mut self) {
+            // SAFETY: exactly the address and length `mmap` returned; no
+            // second owner (neither `Copy` nor `Clone`).
+            if unsafe { libc::munmap(self.base, self.len) } != 0 {
+                super::log(format_args!(
+                    "itsalive: munmap uio: {}",
+                    io::Error::last_os_error()
+                ));
+            }
         }
     }
 
@@ -1350,7 +1463,50 @@ mod linux {
 }
 
 #[cfg(target_os = "linux")]
-pub use linux::{DEV_MEM, I2c, MemRegs};
+pub use linux::{DEV_MEM, I2c, MemRegs, UioMap};
+
+/// Where the kernel lists UIO devices.
+pub const UIO_CLASS: &str = "/sys/class/uio";
+
+/// The UIO device under `class` whose `name` is `name`: its index N (for
+/// `/dev/uioN`) and the size of its map 0.
+///
+/// Keyed on the name, never on N, which follows probe order. Exactly one
+/// must answer: two nodes with one name would make the choice arbitrary.
+pub fn find_uio(class: &Path, name: &str) -> Result<(u32, usize)> {
+    let what = format!("UIO node {name:?} under {}", class.display());
+    let entries =
+        std::fs::read_dir(class).map_err(|e| Error::io(format!("list {}", class.display()), e))?;
+    let mut found = Vec::new();
+    for entry in entries.flatten() {
+        let dir = entry.path();
+        let Some(index) = dir
+            .file_name()
+            .and_then(|n| n.to_str())
+            .and_then(|n| n.strip_prefix("uio"))
+            .and_then(|n| n.parse::<u32>().ok())
+        else {
+            continue;
+        };
+        if std::fs::read_to_string(dir.join("name")).is_ok_and(|n| n.trim() == name) {
+            found.push((index, dir));
+        }
+    }
+    match found.as_slice() {
+        [] => Err(Error::io(what, io::Error::from(io::ErrorKind::NotFound))),
+        [(index, dir)] => {
+            let path = dir.join("maps/map0/size");
+            let raw = std::fs::read_to_string(&path)
+                .map_err(|e| Error::io(format!("read {}", path.display()), e))?;
+            let hex = raw.trim().trim_start_matches("0x");
+            let size = usize::from_str_radix(hex, 16).map_err(|_| {
+                Error::Unrecognised(format!("{}: {:?}", path.display(), raw.trim()))
+            })?;
+            Ok((*index, size))
+        }
+        _ => Err(Error::Unrecognised(format!("{what}: more than one"))),
+    }
+}
 
 /// Stand-ins for the Linux-only types on any other OS.
 ///
@@ -1406,6 +1562,25 @@ mod unsupported {
     }
 
     /// See the module doc: uninhabited off Linux.
+    pub struct UioMap {
+        never: std::convert::Infallible,
+    }
+
+    impl UioMap {
+        /// Always [`Error::Io`] with [`io::ErrorKind::Unsupported`].
+        pub fn open(name: &str) -> Result<Self> {
+            Err(unsupported(name))
+        }
+    }
+
+    impl crate::de25::LwWindow for UioMap {
+        fn read32(&self, _offset: usize) -> u32 {
+            0
+        }
+        fn write32(&mut self, _offset: usize, _value: u32) {}
+    }
+
+    /// See the module doc: uninhabited off Linux.
     pub struct I2c {
         never: std::convert::Infallible,
     }
@@ -1440,7 +1615,7 @@ mod unsupported {
 }
 
 #[cfg(not(target_os = "linux"))]
-pub use unsupported::{DEV_MEM, I2c, MemRegs};
+pub use unsupported::{DEV_MEM, I2c, MemRegs, UioMap};
 
 #[cfg(test)]
 mod tests {
@@ -1986,5 +2161,55 @@ mod tests {
     fn the_new_traits_are_object_safe_too() {
         let _: Option<&dyn ModeSource> = None;
         let _: Option<&mut dyn PixelSink> = None;
+    }
+    /// A fake `/sys/class/uio` with one directory per `(index, name, size)`.
+    fn uio_class(tag: &str, nodes: &[(u32, &str, &str)]) -> PathBuf {
+        let root = scratch(tag);
+        for (index, name, size) in nodes {
+            let dir = root.join(format!("uio{index}"));
+            fs::create_dir_all(dir.join("maps/map0")).unwrap();
+            fs::write(dir.join("name"), format!("{name}\n")).unwrap();
+            fs::write(dir.join("maps/map0/size"), format!("{size}\n")).unwrap();
+        }
+        root
+    }
+
+    #[test]
+    fn a_uio_node_is_found_by_name_not_by_number() {
+        let root = uio_class(
+            "uio-by-name",
+            &[
+                (0, "mister_f2h_irq1", "0x0"),
+                (64, "mister_lw_bridge", "0x00200000"),
+                (65, "mister_ddr_aperture", "0x20000000"),
+            ],
+        );
+        fs::write(root.join("not-a-uio"), "x").unwrap();
+        assert_eq!(
+            find_uio(&root, "mister_lw_bridge").unwrap(),
+            (64, 0x20_0000)
+        );
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn a_missing_uio_node_is_exit_14_and_a_duplicate_is_15() {
+        let root = uio_class(
+            "uio-dup",
+            &[
+                (3, "mister_lw_bridge", "0x1000"),
+                (7, "mister_lw_bridge", "0x1000"),
+            ],
+        );
+        assert_eq!(
+            find_uio(&root, "mister_lw_bridge").unwrap_err().exit_code(),
+            15
+        );
+        assert_eq!(find_uio(&root, "mister_ocram").unwrap_err().exit_code(), 14);
+        assert_eq!(
+            find_uio(&root.join("absent"), "x").unwrap_err().exit_code(),
+            14
+        );
+        fs::remove_dir_all(&root).unwrap();
     }
 }

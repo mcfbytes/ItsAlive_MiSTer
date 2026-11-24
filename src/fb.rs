@@ -127,8 +127,11 @@ const FB_BUFFER: u32 = 0;
 /// they carry no palette page and get no skip.
 ///
 /// For buffer 0: `0x22000000 + 0 + 0x1000 = 0x22001000`.
-const fn fb_addr(n: u32) -> u32 {
-    FB_ADDR + (FB_SIZE * 4 * n) + if n == 0 { 4096 } else { 0 }
+///
+/// `region` is [`FB_ADDR`] on the DE10; the DE25's region has the same layout
+/// at its own base.
+const fn fb_addr(region: u32, n: u32) -> u32 {
+    region + (FB_SIZE * 4 * n) + if n == 0 { 4096 } else { 0 }
 }
 
 /// Everything about the picture that the `UIO_SET_FBUF` burst needs: the
@@ -219,6 +222,14 @@ impl FbGeometry {
         }
     }
 
+    /// The same frame buffer scaled onto a fixed `hact` x `vact` output
+    /// raster instead of the mode's own: the DE25, whose fabric owns the
+    /// timing, so words 7 and 9 must span its raster (a third-party DE25
+    /// port's Main does the same, with 1920x1080).
+    pub const fn on_raster(self, hact: u16, vact: u16) -> Self {
+        Self { hact, vact, ..self }
+    }
+
     /// The framebuffer's width in pixels, for the caller's log line — Main's is
     /// `"Linux frame buffer: %dx%d, stride = %d bytes"` (`video.cpp:3513`).
     pub const fn width(&self) -> u16 {
@@ -255,7 +266,13 @@ impl FbGeometry {
 /// | 9 | `vact - 1`, scaled bottom | `:3510` |
 /// | 10 | `fb_width * 4`, stride in bytes | `:3511` |
 pub const fn enable_words(geom: &FbGeometry) -> [u16; 10] {
-    let addr = fb_addr(FB_BUFFER);
+    enable_words_at(FB_ADDR, geom)
+}
+
+/// [`enable_words`] for a frame-buffer region at `region` (the DE25's is
+/// `0xA000_0000`); the DE10's is [`FB_ADDR`].
+pub const fn enable_words_at(region: u32, geom: &FbGeometry) -> [u16; 10] {
+    let addr = fb_addr(region, FB_BUFFER);
 
     [
         // video.cpp:3502 - `spi_w((uint16_t)(FB_EN | FB_FMT_RxB | FB_FMT_8888))`
@@ -870,14 +887,14 @@ mod tests {
         // video.cpp:3491 - `FB_ADDR + (FB_SIZE * 4 * n) + (n ? 0 : 4096)`.
         // Buffer 0 is pushed past the MiSTer_fb header page, which matches the
         // hard-coded `FB_ADDR + 4096` of the other caller (video.cpp:4282).
-        assert_eq!(fb_addr(0), 0x2200_1000);
+        assert_eq!(fb_addr(FB_ADDR, 0), 0x2200_1000);
         // Buffers 1 and 2 are Main's menu backgrounds: no header page, no skip.
-        assert_eq!(fb_addr(1), 0x2200_0000 + 0x7E_9000);
-        assert_eq!(fb_addr(2), 0x2200_0000 + 0xFD_2000);
+        assert_eq!(fb_addr(FB_ADDR, 1), 0x2200_0000 + 0x7E_9000);
+        assert_eq!(fb_addr(FB_ADDR, 2), 0x2200_0000 + 0xFD_2000);
 
         // Words 2 and 3 are that address split low/high (video.cpp:3503-3504).
-        assert_eq!(fb_addr(0) & 0xFFFF, 0x1000);
-        assert_eq!(fb_addr(0) >> 16, 0x2200);
+        assert_eq!(fb_addr(FB_ADDR, 0) & 0xFFFF, 0x1000);
+        assert_eq!(fb_addr(FB_ADDR, 0) >> 16, 0x2200);
     }
 
     #[test]
@@ -1036,6 +1053,24 @@ mod tests {
             w,
             [0x8016, 0x1000, 0x2200, 1280, 720, 0, 1279, 0, 1439, 5120]
         );
+    }
+
+    #[test]
+    fn the_de25_burst_is_its_region_and_its_raster() {
+        // 720p frame buffer at 0xA0001000, scaled onto the fabric's fixed
+        // 1920x1080: the address and words 7 and 9 change, nothing else.
+        let geom = FbGeometry::for_mode(1280, 720, false).on_raster(1920, 1080);
+        assert_eq!(
+            enable_words_at(0xA000_0000, &geom),
+            [0x8016, 0x1000, 0xA000, 1280, 720, 0, 1919, 0, 1079, 5120]
+        );
+        assert_eq!(mode_param_line(&geom), "8888 1 1280 720 5120\n");
+    }
+
+    #[test]
+    fn enable_words_is_the_de10_region() {
+        let geom = FbGeometry::for_mode(1280, 720, false);
+        assert_eq!(enable_words(&geom), enable_words_at(FB_ADDR, &geom));
     }
 
     #[test]

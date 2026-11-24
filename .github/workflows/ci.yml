@@ -71,6 +71,8 @@ jobs:
         target:
           - armv7-unknown-linux-gnueabihf
           - armv7-unknown-linux-musleabihf
+          - aarch64-unknown-linux-gnu
+          - aarch64-unknown-linux-musl
     steps:
       - uses: actions/checkout@v5
       - name: Install the pinned toolchain
@@ -91,6 +93,12 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
             gcc-arm-linux-gnueabihf libc6-dev-armhf-cross
+      - name: Install the AArch64 cross linker and the target glibc
+        if: matrix.target == 'aarch64-unknown-linux-gnu'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            gcc-aarch64-linux-gnu libc6-dev-arm64-cross
       # Lint on the target, not just on the host. src/hw.rs is the reason:
       # libc::Ioctl is c_ulong on gnueabihf and c_int on musleabihf, and
       # libc::off_t is 32-bit on one and 64-bit on the other, so the host job
@@ -98,7 +106,7 @@ jobs:
       - run: cargo clippy --locked --target ${{ matrix.target }} --all-targets -- -D warnings
       - run: cargo build --locked --release --target ${{ matrix.target }}
       - name: Check the musl build really is static
-        if: matrix.target == 'armv7-unknown-linux-musleabihf'
+        if: endsWith(matrix.target, '-musleabihf') || endsWith(matrix.target, '-musl')
         run: |
           file target/${{ matrix.target }}/release/itsalive | tee /dev/stderr \
             | grep -q 'statically linked'

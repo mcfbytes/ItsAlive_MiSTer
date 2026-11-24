@@ -36,6 +36,8 @@
 //! through [`hw::log`] and `probe`'s findings through [`out`], which drop the
 //! error instead (see [`hw::log`]'s doc for the whole argument).
 
+use itsalive::board::{self, Board};
+use itsalive::de25::{self, LwRegs, LwWindow};
 use itsalive::hw::{I2cBus, ModeSink, ModeSource, PixelSink, TextSink};
 use itsalive::mailbox::{Deadline, Mailbox, MonotonicDeadline, Regs};
 use itsalive::video::Modeline;
@@ -78,8 +80,13 @@ exit codes:
   0   done                      11  mailbox timeout
   2   usage error               12  ADV7513 not found on any i2c bus
   10  no bitstream in the       13  ADV7513 on more than one i2c bus
-      fabric (GPI bit 31)       14  /dev/mem, /dev/i2c-*, sysfs, tty
-                                    or /dev/fb0 unopenable";
+      fabric (GPI bit 31; on    14  /dev/mem, /dev/i2c-*, sysfs, tty
+      the DE25, fabric not          or /dev/fb0 unopenable
+      known configured)         15  unrecognised board or fabric MAGIC
+
+On a DE25-Nano the fabric owns the ADV7513 and the 1080p60 timing: `hdmi`
+programs the scaler base, `fb enable` scales the frame buffer onto 1080p,
+and `hdmi --off` exits 12.";
 
 fn main() -> ExitCode {
     // `std::env::args()` panics on an argument that is not UTF-8, and a panic
@@ -573,8 +580,24 @@ where
     // T1.4's note: the bridge between a `Modeline` and the framebuffer's own
     // geometry is `for_mode`, and this is the only place it is crossed.
     let geom = fb::FbGeometry::for_mode(mode.hact, mode.vact, mode.pr != 0);
+    fb_enable_with(mb, sink, &geom, &fb::enable_words(&geom))
+}
 
-    let reply = mb.command_if_supported(mailbox::UIO_SET_FBUF, &fb::enable_words(&geom))?;
+/// [`fb_enable`] after its guard, with the geometry and burst decided by the
+/// caller: the DE10's from the mode, the DE25's on the fabric's raster.
+fn fb_enable_with<R, D, M>(
+    mb: &mut Mailbox<R, D>,
+    sink: &mut M,
+    geom: &fb::FbGeometry,
+    words: &[u16; 10],
+) -> Result<()>
+where
+    R: Regs,
+    D: Deadline,
+    M: ModeSink + ?Sized,
+{
+    let geom = *geom;
+    let reply = mb.command_if_supported(mailbox::UIO_SET_FBUF, words)?;
     if reply == 0 {
         hw::log(format_args!(
             "itsalive: core doesn't support HPS frame buffer; /dev/fb0 not switched in"
@@ -805,12 +828,15 @@ fn probe_findings() -> (Vec<Finding>, Option<Error>) {
                 )
             })
         },
-        || {
-            std::fs::metadata(hw::FB_MODE_PATH)
-                .map(|_| format!("{} present", hw::FB_MODE_PATH))
-                .map_err(|e| Error::io(format!("stat {}", hw::FB_MODE_PATH), e))
-        },
+        fb_mode_present,
     )
+}
+
+/// `probe`'s third question, on either board: is the kernel's knob there?
+fn fb_mode_present() -> Result<String> {
+    std::fs::metadata(hw::FB_MODE_PATH)
+        .map(|_| format!("{} present", hw::FB_MODE_PATH))
+        .map_err(|e| Error::io(format!("stat {}", hw::FB_MODE_PATH), e))
 }
 
 /// [`probe_findings`] with its three questions handed in, which is the only
@@ -975,6 +1001,26 @@ fn open_mailbox() -> Result<Mailbox<hw::MemRegs, MonotonicDeadline>> {
 /// Nothing but the five openers lives here: the ordering, the guards and the
 /// choice of sequence are [`dispatch`]'s, where a test can drive them.
 fn execute(cmd: Command) -> Result<()> {
+    // Only the fabric commands ask which board this is; `say`, `image` and
+    // `--help` are the same everywhere and must work on a build host.
+    let fabric = matches!(
+        cmd,
+        Command::Probe { .. }
+            | Command::Hdmi { .. }
+            | Command::FbEnable { .. }
+            | Command::FbDisable
+            | Command::Up { .. }
+    );
+    if fabric && board::detect()? == Board::De25Nano {
+        return dispatch_de25(
+            cmd,
+            de25::guard_from_system,
+            || hw::UioMap::open(de25::LW_UIO_NAME),
+            MonotonicDeadline::default(),
+            hw::ModeFile::new,
+            fb_mode_present,
+        );
+    }
     dispatch(
         cmd,
         open_mailbox,
@@ -1099,6 +1145,108 @@ where
     }
 }
 
+// ---------------------------------------------------------------------------
+// The DE25-Nano
+// ---------------------------------------------------------------------------
+
+/// The DE25's way in: the guard, then the LW window, then MAGIC and `fbcfg`.
+///
+/// The order is the hazard's (`docs/ARCHITECTURE.md` §9): nothing is mapped
+/// until the kernel's state says the fabric is configured, and nothing is
+/// written until the mailbox MAGIC has been read and is right.
+fn de25_bring_up<W: LwWindow>(
+    guard: impl FnOnce() -> Result<()>,
+    lw: impl FnOnce() -> Result<W>,
+) -> Result<W> {
+    guard()?;
+    let mut w = lw()?;
+    de25::check_and_program(&mut w)?;
+    hw::log(format_args!(
+        "itsalive: de25: fabric MAGIC ok, scaler base {:#010X}",
+        de25::SCALER_BASE
+    ));
+    Ok(w)
+}
+
+/// [`dispatch`] for the DE25-Nano's fabric commands.
+///
+/// No PLL, no timings, no i2c: the fabric programs the ADV7513 itself and
+/// its ascal output runs at a fixed 1080p60, so `hdmi` is the scaler base
+/// and `up` is `hdmi` plus `fb enable` with the frame buffer scaled onto
+/// that raster. `--mode` sizes the frame buffer only.
+fn dispatch_de25<W, D, M>(
+    cmd: Command,
+    guard: impl FnOnce() -> Result<()>,
+    lw: impl FnOnce() -> Result<W>,
+    deadline: D,
+    mode_sink: impl FnOnce() -> M,
+    fb_mode: impl FnOnce() -> Result<String>,
+) -> Result<()>
+where
+    W: LwWindow,
+    D: Deadline,
+    M: ModeSink,
+{
+    let geom = |mode: &Modeline| {
+        let (w, h) = de25::RASTER;
+        fb::FbGeometry::for_mode(mode.hact, mode.vact, mode.pr != 0).on_raster(w, h)
+    };
+    match cmd {
+        Command::Probe { json } => {
+            let findings = probe_findings_with(
+                || {
+                    guard()?;
+                    let w = lw()?;
+                    de25::check_magic(&w)?;
+                    Ok(LwRegs(w).gpi_read())
+                },
+                || Ok("driven by the fabric on the DE25, not on an HPS i2c bus".to_string()),
+                fb_mode,
+            );
+            cmd_probe(json, findings)
+        }
+
+        Command::Hdmi { off: true, .. } => {
+            hw::log(format_args!(
+                "itsalive: de25: the ADV7513 is on the fabric's i2c; the HPS cannot power it down"
+            ));
+            Err(Error::NoAdv7513)
+        }
+
+        Command::Hdmi { off: false, .. } => {
+            de25_bring_up(guard, lw)?;
+            let (w, h) = de25::RASTER;
+            hw::log(format_args!(
+                "itsalive: de25: the fabric drives the ADV7513 at {w}x{h}; no timing to send"
+            ));
+            Ok(())
+        }
+
+        Command::FbEnable { mode } | Command::Up { mode } => {
+            let mut mb = Mailbox::new(LwRegs(de25_bring_up(guard, lw)?), deadline);
+            require_bitstream(&mb)?;
+            let geom = geom(&mode);
+            let mut sink = mode_sink();
+            fb_enable_with(
+                &mut mb,
+                &mut sink,
+                &geom,
+                &fb::enable_words_at(de25::FB_REGION, &geom),
+            )
+        }
+
+        Command::FbDisable => {
+            let mut mb = Mailbox::new(LwRegs(de25_bring_up(guard, lw)?), deadline);
+            fb_disable(&mut mb)
+        }
+
+        // `execute` sends only the fabric commands here.
+        Command::Help | Command::Say { .. } | Command::Image { .. } => {
+            Err(usage("not a DE25 fabric command"))
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1147,6 +1295,10 @@ mod tests {
         /// is invisible in the pixels: too large and a mistyped path still
         /// aborts the process, and nothing else here would notice.
         SourceLimit(u64),
+        /// DE25: a MAGIC register was read at this LW offset.
+        Magic(usize),
+        /// DE25: `fbcfg`'s GPO was written with this base.
+        Fbcfg(u32),
     }
 
     type Log = Rc<RefCell<Vec<Event>>>;
@@ -2430,6 +2582,8 @@ mod tests {
                 ),
                 14,
             ),
+            (Error::FabricNotReady("de25_core=none".into()), 10),
+            (Error::Unrecognised("MAGIC 0xFFFFFFFF".into()), 15),
         ];
         for (err, code) in cases {
             assert_eq!(err.exit_code(), code, "{err}");
@@ -3024,5 +3178,273 @@ mod tests {
         ] {
             parse_usage(args);
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // The DE25-Nano
+    // -----------------------------------------------------------------------
+
+    /// The DE25's LW window: the mailbox decoded by a [`FakeRegs`], the two
+    /// MAGICs and `fbcfg`, every access logged.
+    struct FakeLw {
+        regs: FakeRegs,
+        magic: u32,
+        fbcfg_magic: u32,
+        fbcfg: u32,
+    }
+
+    impl FakeLw {
+        fn new(log: &Log) -> Self {
+            Self {
+                regs: FakeRegs::new(log, 1),
+                magic: 0x5CA6_23A4,
+                fbcfg_magic: de25::FBCFG_MAGIC,
+                fbcfg: 0,
+            }
+        }
+    }
+
+    impl LwWindow for FakeLw {
+        fn read32(&self, offset: usize) -> u32 {
+            match offset {
+                o if o == de25::MAILBOX + de25::GPI => self.regs.gpi_read(),
+                o if o == de25::MAILBOX + de25::MAGIC => {
+                    self.regs.push(Event::Magic(o));
+                    self.magic
+                }
+                o if o == de25::FBCFG + de25::MAGIC => {
+                    self.regs.push(Event::Magic(o));
+                    self.fbcfg_magic
+                }
+                o if o == de25::FBCFG + de25::GPO => self.fbcfg,
+                other => panic!("read of an unexpected LW offset {other:#X}"),
+            }
+        }
+
+        fn write32(&mut self, offset: usize, value: u32) {
+            match offset {
+                o if o == de25::MAILBOX + de25::GPO => self.regs.gpo_write(value),
+                o if o == de25::FBCFG + de25::GPO => {
+                    self.regs.push(Event::Fbcfg(value));
+                    self.fbcfg = value;
+                }
+                other => panic!("write to an unexpected LW offset {other:#X}"),
+            }
+        }
+    }
+
+    /// `dispatch_de25` with a guard that answers `guard`, a window from
+    /// `make`, and a 720p knob; returns the result and the events.
+    fn run_de25(
+        cmd: Command,
+        guard: Result<()>,
+        make: impl FnOnce(&Log) -> FakeLw,
+    ) -> (Result<()>, Vec<Event>) {
+        let log = log_new();
+        let opened = Rc::clone(&log);
+        let window = Rc::clone(&log);
+        let sink = Rc::clone(&log);
+        let result = dispatch_de25(
+            cmd,
+            || guard,
+            move || {
+                opened.borrow_mut().push(Event::Open("lw"));
+                Ok(make(&window))
+            },
+            MonotonicDeadline::default(),
+            move || FakeMode::new(&sink),
+            || Ok("knob present".to_string()),
+        );
+        let got = events(&log);
+        (result, got)
+    }
+
+    fn not_ready() -> Result<()> {
+        Err(Error::FabricNotReady("de25_core=none".to_string()))
+    }
+
+    #[test]
+    fn de25_up_is_magic_then_fbcfg_then_the_frame_buffer_on_1080p() {
+        let (result, got) = run_de25(
+            Command::Up {
+                mode: video::MODE_720P,
+            },
+            Ok(()),
+            FakeLw::new,
+        );
+        result.expect("a healthy DE25 fabric");
+        let mut expected = vec![
+            Event::Open("lw"),
+            Event::Magic(0x1_011C),
+            Event::Magic(0x1_021C),
+            Event::Fbcfg(0x9E00_0000),
+            Event::EnableIo,
+            Event::Word(mailbox::UIO_SET_FBUF),
+        ];
+        // Buffer 0 at 0xA0001000, 1280x720, scaled onto 0..1919 x 0..1079.
+        expected
+            .extend([0x8016, 0x1000, 0xA000, 1280, 720, 0, 1919, 0, 1079, 5120].map(Event::Word));
+        expected.push(Event::DisableIo);
+        expected.push(Event::ModeLine("8888 1 1280 720 5120\n".to_string()));
+        assert_eq!(got, expected);
+    }
+
+    #[test]
+    fn de25_sends_no_timing_and_touches_no_i2c() {
+        for cmd in [
+            Command::Up {
+                mode: video::MODE_720P,
+            },
+            Command::Hdmi {
+                mode: video::MODE_720P,
+                off: false,
+            },
+        ] {
+            let (result, got) = run_de25(cmd.clone(), Ok(()), FakeLw::new);
+            result.expect("healthy");
+            assert!(
+                !got.contains(&Event::Word(mailbox::UIO_SET_VIDEO)),
+                "{cmd:?}"
+            );
+            assert!(!got.contains(&Event::Word(mailbox::UIO_BUT_SW)), "{cmd:?}");
+            assert!(!got.iter().any(|e| matches!(e, Event::I2c(..))), "{cmd:?}");
+        }
+    }
+
+    #[test]
+    fn de25_hdmi_is_the_scaler_base_and_nothing_on_the_mailbox() {
+        let (result, got) = run_de25(
+            Command::Hdmi {
+                mode: video::MODE_720P,
+                off: false,
+            },
+            Ok(()),
+            FakeLw::new,
+        );
+        result.expect("healthy");
+        assert_eq!(
+            got,
+            vec![
+                Event::Open("lw"),
+                Event::Magic(0x1_011C),
+                Event::Magic(0x1_021C),
+                Event::Fbcfg(0x9E00_0000),
+            ]
+        );
+    }
+
+    #[test]
+    fn de25_guard_refusing_opens_nothing() {
+        for cmd in [
+            Command::Up {
+                mode: video::MODE_720P,
+            },
+            Command::FbEnable {
+                mode: video::MODE_720P,
+            },
+            Command::FbDisable,
+            Command::Hdmi {
+                mode: video::MODE_720P,
+                off: false,
+            },
+            Command::Probe { json: false },
+        ] {
+            let (result, got) = run_de25(cmd.clone(), not_ready(), FakeLw::new);
+            let err = result.expect_err("an unconfigured fabric");
+            assert_eq!(err.exit_code(), 10, "{cmd:?}");
+            assert!(got.is_empty(), "{cmd:?} touched {got:?}");
+        }
+    }
+
+    #[test]
+    fn de25_magic_mismatch_refuses_before_any_write() {
+        for cmd in [
+            Command::Up {
+                mode: video::MODE_720P,
+            },
+            Command::FbDisable,
+            Command::Hdmi {
+                mode: video::MODE_720P,
+                off: false,
+            },
+            Command::Probe { json: true },
+        ] {
+            let (result, got) = run_de25(cmd.clone(), Ok(()), |log| FakeLw {
+                magic: 0xFFFF_FFFF,
+                ..FakeLw::new(log)
+            });
+            assert_eq!(result.expect_err("wrong magic").exit_code(), 15, "{cmd:?}");
+            assert_eq!(
+                got,
+                vec![Event::Open("lw"), Event::Magic(0x1_011C)],
+                "{cmd:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn de25_fbcfg_magic_mismatch_writes_nothing() {
+        let (result, got) = run_de25(
+            Command::Up {
+                mode: video::MODE_720P,
+            },
+            Ok(()),
+            |log| FakeLw {
+                fbcfg_magic: 0x5CA6_23A4,
+                ..FakeLw::new(log)
+            },
+        );
+        assert_eq!(result.expect_err("wrong fbcfg").exit_code(), 15);
+        assert_eq!(
+            got,
+            vec![
+                Event::Open("lw"),
+                Event::Magic(0x1_011C),
+                Event::Magic(0x1_021C)
+            ]
+        );
+    }
+
+    #[test]
+    fn de25_probe_writes_nothing() {
+        let (result, got) = run_de25(Command::Probe { json: false }, Ok(()), FakeLw::new);
+        result.expect("all three findings pass");
+        assert_eq!(
+            got,
+            vec![
+                Event::Open("lw"),
+                Event::Magic(0x1_011C),
+                Event::Magic(0x1_021C)
+            ]
+        );
+    }
+
+    #[test]
+    fn de25_hdmi_off_is_exit_12_and_touches_nothing() {
+        let (result, got) = run_de25(
+            Command::Hdmi {
+                mode: video::MODE_720P,
+                off: true,
+            },
+            Ok(()),
+            FakeLw::new,
+        );
+        assert_eq!(result.expect_err("no HPS ADV7513").exit_code(), 12);
+        assert!(got.is_empty());
+    }
+
+    #[test]
+    fn de25_fb_disable_is_the_single_zero_word() {
+        let (result, got) = run_de25(Command::FbDisable, Ok(()), FakeLw::new);
+        result.expect("healthy");
+        assert_eq!(
+            got[4..],
+            [
+                Event::EnableIo,
+                Event::Word(mailbox::UIO_SET_FBUF),
+                Event::Word(0),
+                Event::DisableIo
+            ]
+        );
     }
 }

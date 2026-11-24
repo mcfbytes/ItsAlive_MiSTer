@@ -105,7 +105,14 @@ cargo build --release --target armv7-unknown-linux-gnueabihf
 
 # the installer's initramfs (static musl) — needs no cross gcc, rustup ships the linker
 cargo build --release --target armv7-unknown-linux-musleabihf
+
+# the DE25-Nano (AArch64): the same pair, gcc-aarch64-linux-gnu for glibc
+cargo build --release --target aarch64-unknown-linux-gnu
+cargo build --release --target aarch64-unknown-linux-musl
 ```
+
+The DE25-Nano is detected at run time and takes its own register path
+(`docs/ARCHITECTURE.md` §9); it is untested on hardware.
 
 Both targets are built and kept on purpose: the installed MiSTer system is
 glibc, the installer's initramfs is static musl, and the two disagree on types

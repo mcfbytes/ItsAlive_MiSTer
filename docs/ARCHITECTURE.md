@@ -570,7 +570,10 @@ src/
   say.rs         write text to /dev/tty1 (v1); direct 8x16 draw is a later task
   hw.rs          the only module that touches /dev/mem, /dev/i2c-*, sysfs,
                  tty and /dev/fb0: the mmapped Regs, I2C bus discovery and
-                 writes, the sysfs knob both ways, and the two byte writers
+                 writes, the sysfs knob both ways, and the two byte writers;
+                 also the DE25's UIO mapping, found by name
+  board.rs       DE10 or DE25, from /proc/device-tree/compatible
+  de25.rs        the DE25 fabric guard, MAGIC checks, fbcfg, the LW Regs
 ```
 
 The three lines that moved are `mailbox.rs`'s mapping, `adv7513.rs`'s bus
@@ -663,6 +666,10 @@ itsalive --help                 the usage text, on stdout, exit 0
 | 12 | ADV7513 not found on any bus | continue silently |
 | 13 | ADV7513 on more than one bus | continue, log |
 | 14 | `/dev/mem`, `/dev/i2c-*`, sysfs, tty or `/dev/fb0` could not be opened or used | continue silently |
+| 15 | unrecognised board (non-ARMv7 build, unknown `compatible`) or DE25 fabric MAGIC wrong | continue silently |
+
+On the DE25 (§9) exit 10 also covers the fabric guard refusing: the kernel's
+state does not show a configured fabric, so nothing was touched.
 
 **`image` adds no exit code.** It reuses the table above, and the split is that
 a *state* the caller could have avoided is 2 and a *device* that would not
@@ -728,3 +735,66 @@ and `fb enable` after `hdmi` after `up` is harmless.
 - **Not while Main_MiSTer runs.** Two writers on the mailbox would corrupt
   each other's transfers. `probe` cannot detect a running daemon from the
   hardware side; the caller is responsible, and the README says so.
+
+## 9. The DE25-Nano
+
+The same binary source runs on a DE25-Nano (Agilex 5, AArch64), built for
+that board's arch (`aarch64-unknown-linux-gnu` in Buildroot_MiSTer's DE25
+image). The board is read from `/proc/device-tree/compatible`:
+`intel,socfpga-agilex5` is the DE25, `altr,socfpga-cyclone5` the DE10, and
+anything else is the DE10 on an ARMv7 build (today's behaviour, unchanged) and
+exit 15 on any other. Only `probe`, `hdmi`, `fb` and `up` ask; `say`, `image`
+and `--help` are the same on both.
+
+The facts below are read from a third-party DE25 port's fabric and scripts and
+from Buildroot_MiSTer's DE25 device tree; no code is taken from either.
+
+**The register path.** The fabric re-hosts the Cyclone V GPO/GPI pair as a soft
+register block behind the lightweight HPS-to-FPGA bridge, which the DE25 image
+publishes as the UIO node `mister_lw_bridge` (`0x2000_0000`, 2 MiB). It is
+found by its sysfs `name`, never by number, and never through `/dev/mem`
+(`STRICT_DEVMEM`). In that window:
+
+| Offset | Register | |
+|---|---|---|
+| `0x1_0100` | mailbox GPO | the §2 protocol, word for word, including the core-magic gate on GPI while GPO bit 31 is clear |
+| `0x1_0104` | mailbox GPI | |
+| `0x1_011C` | mailbox MAGIC | `0x5CA623xx`, `xx` the core type |
+| `0x1_0200` | `fbcfg` GPO | ascal's DDR base; 0 gates ascal off, and every full reconfiguration clears it |
+| `0x1_021C` | `fbcfg` MAGIC | `0x5CA623FB` |
+
+**The hazard.** On Agilex 5 a read of the LW bridge while the fabric is
+unconfigured is an asynchronous SError, not a failed probe, and there is no
+GPI bit 31 to ask first. So nothing is mapped until the **fabric guard**
+passes, which mirrors the third-party port's own guard, as facts:
+
+1. `de25_core=<core>` on the kernel command line is U-Boot saying it loaded a
+   core: pass. `de25_core=none` (or empty) means it left the fabric empty:
+   pass only if `/sys/class/fpga_manager/fpga0/state` is `operating` (a load
+   since boot).
+2. No token, but an HPS-first marker (`/media/fat/HPS_FIRST_MODE` or
+   `/etc/HPS_FIRST_MODE`): pass only on `operating`.
+3. Otherwise the fabric was configured from QSPI before the HPS booted, and
+   `fpga0` reads `unknown` because the kernel did not do the load: pass.
+
+One rule is ours: an `fpga0` state other than `operating` or `unknown`
+(mid-load, failed) always refuses. A refusal is exit 10 and touches nothing.
+
+**The sequence**, after the guard:
+
+1. Read the mailbox MAGIC. Wrong: exit 15, nothing written.
+2. Read `fbcfg`'s MAGIC. Wrong: exit 15, nothing written.
+3. Write `0x9E00_0000` (the `mister-scaler` reservation, ascal's 32 MiB
+   scratch) to `fbcfg`, and read it back. This is `hdmi` on this board.
+4. `UIO_SET_FBUF` (§5) with buffer 0 at `0xA000_1000` (the `mister-fb`
+   reservation plus the palette page, where `MiSTer_fb`'s `smem_start` is),
+   the frame buffer's own size from `--mode`, and the scaled rectangle set to
+   the fabric's 1920x1080 raster. Then the sysfs line, as on the DE10.
+
+**What is not sent.** No `UIO_SET_VIDEO`, no `UIO_BUT_SW` and no i2c. The DE25's
+HDMI I2C pins belong to the fabric, which programs the ADV7513 itself, and its
+ascal output and pixel clock are a fixed 1080p60; the HPS i2c bus does not
+reach the chip. So `hdmi --off` is exit 12, and `--mode` sizes only the frame
+buffer: `up --mode 720p` puts a 1280x720 `/dev/fb0` on a 1080p screen.
+
+**Not while the port's Main or its `mister-fb` service runs**, for §8's reason.
