@@ -777,15 +777,18 @@ passes, which mirrors the third-party port's own guard, as facts:
 3. Otherwise the fabric was configured from QSPI before the HPS booted, and
    `fpga0` reads `unknown` because the kernel did not do the load: pass.
 
-One rule is ours: an `fpga0` state other than `operating` or `unknown`
-(mid-load, failed) always refuses. A refusal is exit 10 and touches nothing.
+Two rules are ours: an `fpga0` state other than `operating` or `unknown`
+(mid-load, failed) always refuses, and so does no `fpga0` at all, since then
+the kernel cannot vouch for the fabric. A refusal is exit 10 and touches
+nothing.
 
 **The sequence**, after the guard:
 
 1. Read the mailbox MAGIC. Wrong: exit 15, nothing written.
 2. Read `fbcfg`'s MAGIC. Wrong: exit 15, nothing written.
 3. Write `0x9E00_0000` (the `mister-scaler` reservation, ascal's 32 MiB
-   scratch) to `fbcfg`, and read it back. This is `hdmi` on this board.
+   scratch) to `fbcfg`, and read it back. This is `hdmi` on this board;
+   `fb disable` skips it and leaves the base as it was.
 4. `UIO_SET_FBUF` (§5) with buffer 0 at `0xA000_1000` (the `mister-fb`
    reservation plus the palette page, where `MiSTer_fb`'s `smem_start` is),
    the frame buffer's own size from `--mode`, and the scaled rectangle set to

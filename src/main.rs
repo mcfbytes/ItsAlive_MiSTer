@@ -1149,23 +1149,29 @@ where
 // The DE25-Nano
 // ---------------------------------------------------------------------------
 
-/// The DE25's way in: the guard, then the LW window, then MAGIC and `fbcfg`.
+/// The DE25's way in: the guard, then the LW window, then both MAGICs.
 ///
 /// The order is the hazard's (`docs/ARCHITECTURE.md` §9): nothing is mapped
 /// until the kernel's state says the fabric is configured, and nothing is
 /// written until the mailbox MAGIC has been read and is right.
-fn de25_bring_up<W: LwWindow>(
+fn de25_open<W: LwWindow>(
     guard: impl FnOnce() -> Result<()>,
     lw: impl FnOnce() -> Result<W>,
 ) -> Result<W> {
     guard()?;
-    let mut w = lw()?;
-    de25::check_and_program(&mut w)?;
+    let w = lw()?;
+    de25::check_magic(&w)?;
+    Ok(w)
+}
+
+/// `fbcfg` gets ascal's scratch base: what `hdmi` means on this board.
+fn de25_scaler<W: LwWindow + ?Sized>(w: &mut W) -> Result<()> {
+    de25::program_fbcfg(w)?;
     hw::log(format_args!(
         "itsalive: de25: fabric MAGIC ok, scaler base {:#010X}",
         de25::SCALER_BASE
     ));
-    Ok(w)
+    Ok(())
 }
 
 /// [`dispatch`] for the DE25-Nano's fabric commands.
@@ -1214,7 +1220,7 @@ where
         }
 
         Command::Hdmi { off: false, .. } => {
-            de25_bring_up(guard, lw)?;
+            de25_scaler(&mut de25_open(guard, lw)?)?;
             let (w, h) = de25::RASTER;
             hw::log(format_args!(
                 "itsalive: de25: the fabric drives the ADV7513 at {w}x{h}; no timing to send"
@@ -1222,8 +1228,13 @@ where
             Ok(())
         }
 
+        // With GPO zeroed, GPI is the gated core magic and bit 31 is clear,
+        // so `require_bitstream` cannot refuse here: the MAGIC read in
+        // `de25_open` is this board's bitstream check. Kept for symmetry.
         Command::FbEnable { mode } | Command::Up { mode } => {
-            let mut mb = Mailbox::new(LwRegs(de25_bring_up(guard, lw)?), deadline);
+            let mut w = de25_open(guard, lw)?;
+            de25_scaler(&mut w)?;
+            let mut mb = Mailbox::new(LwRegs(w), deadline);
             require_bitstream(&mb)?;
             let geom = geom(&mode);
             let mut sink = mode_sink();
@@ -1235,8 +1246,9 @@ where
             )
         }
 
+        // Handing the display back to the core leaves ascal's base alone.
         Command::FbDisable => {
-            let mut mb = Mailbox::new(LwRegs(de25_bring_up(guard, lw)?), deadline);
+            let mut mb = Mailbox::new(LwRegs(de25_open(guard, lw)?), deadline);
             fb_disable(&mut mb)
         }
 
@@ -3437,8 +3449,10 @@ mod tests {
     fn de25_fb_disable_is_the_single_zero_word() {
         let (result, got) = run_de25(Command::FbDisable, Ok(()), FakeLw::new);
         result.expect("healthy");
+        // No `fbcfg` write: handing the display back leaves ascal's base alone.
+        assert!(!got.iter().any(|e| matches!(e, Event::Fbcfg(_))));
         assert_eq!(
-            got[4..],
+            got[3..],
             [
                 Event::EnableIo,
                 Event::Word(mailbox::UIO_SET_FBUF),

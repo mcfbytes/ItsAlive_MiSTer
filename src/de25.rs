@@ -73,10 +73,14 @@ pub const HPS_FIRST_MARKERS: [&str; 2] = ["/media/fat/HPS_FIRST_MODE", "/etc/HPS
 /// 3. Otherwise the fabric was configured from QSPI before the HPS ran, and
 ///    the manager reads `unknown` because it did not do the load.
 ///
-/// One rule is ours: a manager in any state but `operating` or `unknown` is
-/// mid-load or failed, and that is never safe, whatever the rules above say.
+/// Two rules are ours: a manager in any state but `operating` or `unknown` is
+/// mid-load or failed, and no manager at all means the kernel cannot vouch
+/// for the fabric. Neither is ever safe, whatever the rules above say.
 pub fn fabric_guard(cmdline: &str, fpga0: Option<&str>, hps_first: bool) -> Result<()> {
-    let state = fpga0.map(str::trim);
+    let Some(state) = fpga0.map(str::trim) else {
+        return Err(Error::FabricNotReady(format!("no {FPGA0_STATE}")));
+    };
+    let state = Some(state);
     let operating = state == Some("operating");
     if let Some(s) = state
         && !operating
@@ -230,7 +234,14 @@ mod tests {
             )
             .is_ok()
         );
-        assert!(fabric_guard("root=/dev/mmcblk0p2", None, false).is_ok());
+    }
+
+    #[test]
+    fn no_fpga_manager_is_always_refused() {
+        for cmdline in ["root=/dev/mmcblk0p2", "de25_core=menu"] {
+            let err = fabric_guard(cmdline, None, false).expect_err(cmdline);
+            assert!(matches!(err, Error::FabricNotReady(_)), "{cmdline}");
+        }
     }
 
     #[test]
